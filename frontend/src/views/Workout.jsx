@@ -273,8 +273,9 @@ function ExerciseBlock({ entryIdx, compact, dense, editing, onToggle, onToggleSi
   // as every other +/- field in the app.
   // Which of the optional control groups this profile wants on screen (Settings → During a
   // workout → Workout controls). The lean default keeps the sets and one "more" button; each
-  // switch brings one of the old always-visible button rows back.
-  const wc = workoutControls(S)
+  // switch brings one of the old always-visible button rows back. Only the coach gets the
+  // groups that reshape the session — see lib/workout-controls.js.
+  const wc = workoutControls(S, { admin: !!useStore.getState().user?.admin })
   const cell = (s, i, col, cls) => (
     <div className={'stp ' + cls + (wc.steppers ? '' : ' plain')}>
       {wc.steppers && <button aria-label={t('Decrease')} onClick={() => bump(s, i, col, -1)}><Icon name="minus" /></button>}
@@ -676,7 +677,8 @@ function ActiveWorkout() {
   const workoutView = A.workoutView || S.workoutView
   const listMode = workoutView === 'list' || workoutView === 'compact'
   const dense = workoutView === 'compact'
-  const wc = workoutControls(S)
+  const admin = useStore(s => !!s.user?.admin)
+  const wc = workoutControls(S, { admin })
   // Superset flow: center the actionable row when completing a set moves to the partner or
   // back to the first exercise of the next round. Entry-bound maps keep repeated exercise IDs
   // distinct, while each rendered set index identifies the existing row within that entry.
@@ -898,7 +900,7 @@ function ActiveWorkout() {
   const focusUnit = firstIdx => update(s => {
     if (!s.active) return
     s.active.cur = firstIdx
-    if (!workoutControls(s).exerciseButtons && (s.workoutView || 'cards') === 'cards') s.active.workoutView = 'cards'
+    if (!workoutControls(s, { admin: !!useStore.getState().user?.admin }).exerciseButtons && (s.workoutView || 'cards') === 'cards') s.active.workoutView = 'cards'
   })
   // The header ⋮ re-lays-out the running session without touching the saved default
   // (Settings → During a workout → Workout view). It writes s.active.workoutView, which the
@@ -1348,7 +1350,7 @@ function ActiveWorkout() {
     </div>}
     {!listMode && <div style={{ height: 10 }} />}
     {wc.exerciseButtons && listMode && A.entries.length > 0 && <div className="muted small" style={{ marginBottom: 6 }}>{t('Move, swap and remove below act on the exercise marked {0}.', t('Current'))}</div>}
-    <Button onClick={() => exercisePicker((ex, quick) => {
+    {wc.addExercise && <Button onClick={() => exercisePicker((ex, quick) => {
       // A freehand add inherits the current unit's routine (its `rid`) so it lands in that
       // routine's block in a combined session and gets a real prescription; a routine-less
       // freestyle session has no `rid` to inherit. It inherits the block's `noProg` too: an
@@ -1390,7 +1392,7 @@ function ActiveWorkout() {
       if (quick) { commit(seed || defaultConfig(ex.id)); useUI.getState().toast(t('“{0}” added to {1}', exerciseNameText(ex), routine ? routine.name : t('Freestyle'))) }
       // The confirm names what it changes: this workout, never the routine behind it.
       else exConfigSheet(ex, null, commit, null, routine, seed, null, t('Add to this workout'))
-    })} icon="plus">{t('Add exercise')}</Button>
+    })} icon="plus">{t('Add exercise')}</Button>}
     {wc.exerciseButtons && A.entries.length > 0 && <>
       <div style={{ height: 6 }} />
       <div className="row">
@@ -1412,16 +1414,19 @@ function ActiveWorkout() {
     <div style={{ height: 10 }} />
     {/* Wrapping up is when you know how the session went, so the note sits with the finish
         button rather than somewhere in the header. */}
-    <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
+    {wc.sessionNote && <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 10 }}>
       <Button size="sm" icon="pencil" variant={A.note ? 'tinted' : undefined} onClick={sessionNoteSheet}>
         {A.note ? t('Edit session note') : t('Add session note')}
       </Button>
-    </div>
+    </div>}
     {(() => {
       const exDone = A.entries.filter(e => e.sets.length && e.sets.every(s => s.done)).length
       const allDone = A.entries.length > 0 && exDone === A.entries.length
+      // One button that says the same thing all session long. It used to count down at you —
+      // "Finish workout early · 2/5" — which turned the way out of an interrupted session into
+      // a scolding. Stopping short is still confirmed (finishWorkout asks), just not announced.
       return <button className={allDone ? 'btn primary' : 'btn ghost dim'} onClick={finishWorkout}>
-        {editing ? t('Save changes') : allDone ? t('Finish workout') : t('Finish workout early · {0} exercises', exDone + '/' + A.entries.length)}
+        {editing ? t('Save changes') : t('Finish workout')}
       </button>
     })()}
     <div className="workout-end-spacer" />

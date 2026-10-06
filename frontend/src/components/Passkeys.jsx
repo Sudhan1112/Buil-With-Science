@@ -11,6 +11,7 @@ import { dateLocale } from '../lib/i18n-core.js'
 import { api, webauthnOK, createPasskey } from '../lib/api.js'
 import { copyText } from '../lib/clipboard.js'
 import { deviceLinkUrl, deviceLabel } from '../lib/device-link.js'
+import { deviceId } from '../lib/device.js'
 import { askAddDeviceData } from '../sheets.jsx'
 import { passwordError, notReached, useAgainOnceReached, ProveOwner } from './PasswordAuth.jsx'
 import QrCanvas from './QrCanvas.jsx'
@@ -290,7 +291,7 @@ export function DeviceLinkRedeemSheet({ close }) {
       const i = info && info.code === c && Date.now() - info.at < CHALLENGE_FRESH_MS ? info : await check(c)
       const credential = await createPasskey(i.options)
       spent = true
-      const r = await post('/api/device-link/verify', { code: c, cid: i.cid, credential, name: deviceLabel() })
+      const r = await post('/api/device-link/verify', { code: c, cid: i.cid, credential, name: deviceLabel(), deviceId: deviceId() })
       const st = useStore.getState()
       useStore.setState({ linkCode: null })
       const same = st.user?.id === r.user.id

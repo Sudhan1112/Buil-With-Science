@@ -33,14 +33,14 @@ services:
     restart: "no"
 
   # Passkey auth + per-user data (Node, no framework).
-  # image: prebuilt (docker compose pull). build: from source (docker compose up --build).
+  #
+  # Built from ./api, always. There is deliberately no `image:` here: upstream openGym publishes
+  # prebuilt images, and with an `image:` set compose pulls one unless you remember `--build`.
+  # Those images are vanilla openGym — no subscriptions, no device lock, no admin portal, no
+  # community hub — so pulling one silently runs a different application against this ./data.
   api:
-    image: ghcr.io/duartesantos8/opengym-api:latest
-    # Default target: no AI runtime, no AI dependency — the image every instance has always had.
-    # To opt into the AI Coach, build the other target instead:
-    #     API_TARGET=coach docker compose up --build api
-    # `--build` matters: with an `image:` also set, compose would otherwise pull the prebuilt
-    # default rather than build the coach one.
+    # Default target: no AI runtime, no AI dependency.
+    # To opt into the AI Coach, build the other target: API_TARGET=coach docker compose up -d
     build:
       context: ./api
       target: ${API_TARGET:-default}
@@ -65,8 +65,8 @@ services:
 
   # Builds the React frontend (multi-stage) and serves it, proxying /api → api
   # and the exercise media from the shared volume. Single origin for passkeys.
+  # Built from source for the same reason as api, above.
   web:
-    image: ghcr.io/duartesantos8/opengym-web:latest
     build:
       context: .
       dockerfile: web/Dockerfile

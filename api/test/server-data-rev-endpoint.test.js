@@ -40,8 +40,10 @@ test('GET /api/data/rev tracks PUT /api/data', async t => {
 
   const h = { cookie: cookie(), origin: 'http://localhost:8080', 'content-type': 'application/json' };
   assert.equal((await fetch(`${base}/api/data/rev`)).status, 401);
-  assert.deepEqual(await (await fetch(`${base}/api/data/rev`, { headers: h })).json(), { rev: 0 });
+  // `planRev` is the coach's program, polled on the same answer; a client's own writes never
+  // move it, and this account has never been assigned one.
+  assert.deepEqual(await (await fetch(`${base}/api/data/rev`, { headers: h })).json(), { rev: 0, planRev: 0 });
   const put = await fetch(`${base}/api/data`, { method: 'PUT', headers: h, body: JSON.stringify({ state: { workouts: [], routines: [] }, baseRev: 0 }) });
   assert.equal(put.status, 200);
-  assert.deepEqual(await (await fetch(`${base}/api/data/rev`, { headers: h })).json(), { rev: 1 });
+  assert.deepEqual(await (await fetch(`${base}/api/data/rev`, { headers: h })).json(), { rev: 1, planRev: 0 });
 });

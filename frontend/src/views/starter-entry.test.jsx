@@ -1,14 +1,17 @@
 // @vitest-environment happy-dom
-// Home and Plan both offer the starter plan to someone who has no routines yet. Both used to
+// The programme editor offers the starter plan to a client who has no routines yet. It used to
 // wire the button straight to the loader, which quietly handed the click event in as the plan
-// id and loaded nothing at all — so both entry points are pinned here.
+// id and loaded nothing at all — so the entry point is pinned here.
+//
+// Home used to carry the same button and is covered no longer: a client cannot load a plan on
+// themselves (views/Home.jsx asks the coach for one instead), and the coach reaches the loader
+// from the editor.
 import React, { act } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createRoot } from 'react-dom/client'
 import { useStore } from '../store/useStore.js'
 import { starterPlanSheet } from '../sheets.jsx'
-import Home from './Home.jsx'
-import Plan from './Plan.jsx'
+import PlanEdit from './PlanEdit.jsx'
 
 vi.mock('react-router-dom', () => ({ useNavigate: () => () => {} }))
 vi.mock('../sheets.jsx', () => ({
@@ -33,9 +36,9 @@ afterEach(() => {
 
 const starterButton = () => [...host.querySelectorAll('button')].find(b => b.textContent === 'Load starter plan')
 
-describe.each([['Home', Home], ['Plan', Plan]])('%s empty state', (_name, View) => {
+describe('the programme editor, empty', () => {
   it('opens the starter plan chooser instead of loading one plan blind', () => {
-    act(() => root.render(<View />))
+    act(() => root.render(<PlanEdit />))
     const button = starterButton()
     expect(button).toBeTruthy()
 
@@ -43,9 +46,9 @@ describe.each([['Home', Home], ['Plan', Plan]])('%s empty state', (_name, View) 
     expect(starterPlanSheet).toHaveBeenCalledTimes(1)
   })
 
-  it('drops the offer once the user has routines', () => {
+  it('drops the offer once there are routines', () => {
     useStore.setState(s => ({ S: { ...s.S, routines: [{ id: 'r', name: 'Mine', emoji: 'star', ex: [] }] } }))
-    act(() => root.render(<View />))
+    act(() => root.render(<PlanEdit />))
     expect(starterButton()).toBeFalsy()
   })
 })

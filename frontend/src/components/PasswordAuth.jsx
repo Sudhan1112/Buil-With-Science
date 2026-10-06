@@ -13,6 +13,7 @@ import { useUI } from '../store/useUI.js'
 import { t } from '../lib/i18n.js'
 import { dateLocale } from '../lib/i18n-core.js'
 import { api, webauthnOK, passkeyAssertion, passwordLogin, passwordRegister, passwordResetRedeem } from '../lib/api.js'
+import { isDeviceLocked, reportSignInError } from './DeviceLocked.jsx'
 import { askAddDeviceData } from '../sheets.jsx'
 import { Row, Button } from './ui.jsx'
 
@@ -111,7 +112,7 @@ export function PasswordSignInSheet({ close, onPasskey }) {
     if (bad) { setErr(bad); return }
     setBusy(true); setErr(null)
     try { await signedIn(reset ? await passwordResetRedeem(n, code.trim(), next) : await passwordLogin(n, pw), close) }
-    catch (e) { setErr(passwordError(e)) }
+    catch (e) { if (isDeviceLocked(e)) { close(); reportSignInError(e) } else setErr(passwordError(e)) }
     finally { setBusy(false) }
   }
   return <>
@@ -179,7 +180,7 @@ export function PasswordRegisterForm({ close, inviteOnly, name, setName, code, s
       st.setUser(u); close()
       if (hasData(useStore.getState().S)) { await st.pushState(); toast(t('Profile created — data from this device moved into it')) }
       else { await st.pullState(); toast(t('Welcome, {0}', u.name)) }
-    } catch (e) { setErr(passwordError(e)) }
+    } catch (e) { if (isDeviceLocked(e)) { close(); reportSignInError(e) } else setErr(passwordError(e)) }
     finally { setBusy(false) }
   }
   return <form onSubmit={submit} noValidate>

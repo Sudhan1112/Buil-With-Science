@@ -1,11 +1,11 @@
-// @vitest-environment happy-dom
-// #276: a full-width "＋ Add routine" under every planned weekday made the week read as a list of
-// buttons. A populated day now offers the same action as a small ＋ in its header; an empty day
+﻿// @vitest-environment happy-dom
+// #276: a full-width "ï¼‹ Add routine" under every planned weekday made the week read as a list of
+// buttons. A populated day now offers the same action as a small ï¼‹ in its header; an empty day
 // is still one tappable row that picks its first routine.
 import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import Plan from './Plan.jsx'
+import Plan from './PlanEdit.jsx'
 import { dayAddRoutineSheet, dayAssignSheet } from '../sheets.jsx'
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
@@ -53,8 +53,8 @@ afterEach(() => {
 const mount = () => act(() => root.render(<Plan />))
 const dayItem = day => [...host.querySelectorAll('.item')].find(el => el.querySelector('.tt')?.textContent === day)
 
-describe('Plan — adding a routine to a day that already has one (#276)', () => {
-  it('offers a compact ＋ in the day header instead of a full-width text button', () => {
+describe('Plan â€” adding a routine to a day that already has one (#276)', () => {
+  it('offers a compact ï¼‹ in the day header instead of a full-width text button', () => {
     mount()
     const monday = dayItem('Monday')
     expect(monday.textContent).not.toContain('Add routine')

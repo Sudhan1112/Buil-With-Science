@@ -1,12 +1,12 @@
-// @vitest-environment happy-dom
+﻿// @vitest-environment happy-dom
 // Issue #142: routines were stuck in the order they were created. `S.routines` is the single
-// order every screen reads — Plan, the Start screen, the day-assignment sheets — so moving one
+// order every screen reads â€” Plan, the Start screen, the day-assignment sheets â€” so moving one
 // here moves it everywhere.
 import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useStore } from '../store/useStore.js'
-import Plan from './Plan.jsx'
+import Plan from './PlanEdit.jsx'
 
 vi.mock('react-router-dom', () => ({ useNavigate: () => vi.fn() }))
 vi.mock('../sheets.jsx', () => ({

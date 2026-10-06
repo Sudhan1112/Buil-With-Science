@@ -50,10 +50,13 @@ const detail = extra => ({
   user: { id: 'u1', name: 'Mallory', created: '2026-09-01T00:00:00Z', disabled: false, admin: false, ...extra },
   unit: 'kg', lastSync: null, routines: [], bodyweight: [], workouts: []
 })
+// Tapping the row opens the coaching sheet (views/AdminClient.jsx); the ⚙ beside it opens the
+// account one, which is where disabling, deleting and password resets live.
 async function openMallory() {
   const page = render(<Admin />)
   await settle()
-  act(() => [...page.querySelectorAll('.item')].find(el => el.textContent.includes('Mallory')).click())
+  const row = [...page.querySelectorAll('.item')].find(el => el.textContent.includes('Mallory'))
+  act(() => row.querySelector('button[aria-label^="Account settings"]').click())
   const sheet = render(mocks.sheets.at(-1).render(() => {}))
   await settle()
   return sheet

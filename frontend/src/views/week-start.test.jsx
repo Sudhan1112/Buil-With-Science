@@ -1,11 +1,11 @@
-// @vitest-environment happy-dom
+﻿// @vitest-environment happy-dom
 // The setting is only worth anything if the screens actually follow it: the toggle has to
 // write the field, and the Plan list has to draw the week in that order.
 import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import Settings from './Settings.jsx'
-import Plan from './Plan.jsx'
+import Plan from './PlanEdit.jsx'
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
 
@@ -69,7 +69,7 @@ afterEach(() => {
 const segButton = label => [...host.querySelectorAll('.seg button')].find(b => b.textContent === label)
 const dayRows = () => [...host.querySelectorAll('.item .tt')].map(e => e.textContent)
 
-describe('Settings — week starts on', () => {
+describe('Settings â€” week starts on', () => {
   const mount = () => act(() => root.render(<Settings />))
 
   it('offers Monday and Sunday and writes the getDay() index', () => {
@@ -91,7 +91,7 @@ describe('Settings — week starts on', () => {
   })
 })
 
-describe('Plan — the week schedule follows the setting', () => {
+describe('Plan â€” the week schedule follows the setting', () => {
   const mount = () => act(() => root.render(<Plan />))
 
   it('runs Monday to Sunday by default', () => {
@@ -119,7 +119,7 @@ describe('Plan — the week schedule follows the setting', () => {
   })
 })
 
-describe('Plan — inline per-day routine management (combine routines)', () => {
+describe('Plan â€” inline per-day routine management (combine routines)', () => {
   const mount = () => act(() => root.render(<Plan />))
   const dayContainer = name => [...host.querySelectorAll('.item')].find(el => el.querySelector('.tt')?.textContent === name)
 
@@ -139,7 +139,7 @@ describe('Plan — inline per-day routine management (combine routines)', () => 
     expect(mon.textContent).toContain('2 routines')
   })
 
-  it('✕ removes a routine, and drops the day key on the last removal', () => {
+  it('âœ• removes a routine, and drops the day key on the last removal', () => {
     mocks.S.week = { 1: ['r1', 'r2'] }
     mount()
     const removeButtons = () => [...dayContainer('Monday').querySelectorAll('button[aria-label="Remove"]')]

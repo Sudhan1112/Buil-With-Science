@@ -69,7 +69,9 @@ describe('Admin user drill-down', () => {
     await settle()
     const row = [...page.querySelectorAll('.item')].find(el => el.textContent.includes('Mallory'))
     expect(row).toBeTruthy()
-    act(() => row.click())
+    // The ⚙, not the row: the row opens the coaching sheet now (views/AdminClient.jsx), and
+    // the account actions moved behind this one.
+    act(() => row.querySelector('button[aria-label^="Account settings"]').click())
     expect(mocks.sheets.length).toBe(1)
     const sheet = render(mocks.sheets[0](() => {}))
     await settle()
@@ -107,7 +109,7 @@ describe('Admin when the users cannot be loaded', () => {
     act(() => retry.click())
     await settle()
     expect(page.querySelector('[role="alert"]')).toBeNull()
-    expect(text(page)).toContain('1 users')
+    expect(text(page)).toContain('1 client')
     expect([...page.querySelectorAll('.item')].some(el => el.textContent.includes('Mallory'))).toBe(true)
   })
 

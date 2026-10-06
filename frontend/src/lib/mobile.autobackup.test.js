@@ -140,11 +140,8 @@ describe('writeAutoBackup where today\'s name belongs to another install', () =>
   })
 })
 
-// Settings writes the count out in its subtitle rather than importing it (its tests mock this
-// module wholesale), so the two are pinned together here.
-it('the Settings subtitle names the same number of copies the pruning keeps', async () => {
-  const fs = await import('node:fs')
-  const src = fs.readFileSync(new URL('../views/Settings.jsx', import.meta.url), 'utf8')
-  const m = src.match(/keeps the newest \{0\}[^']*', (\d+)\)/)
-  expect(m && Number(m[1])).toBe(AUTO_BACKUP_KEEP)
-})
+// There used to be a check here that Settings' subtitle named the same number of copies the
+// pruning keeps. The switch is gone: a copy of the training record in a folder on the phone is
+// exactly the export a client does not get (views/Settings.jsx, "Data"), and CareFit ships as a
+// PWA, where the Capacitor filesystem this writes to does not exist at all. The pruning itself
+// stays covered above, since the code is still here for anyone running the mobile build.

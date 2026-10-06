@@ -125,6 +125,7 @@ const P = {
   camera: <><path d="M3.6 8.8a2 2 0 0 1 2-2h1.9l1.3-2.1h6.4l1.3 2.1h1.9a2 2 0 0 1 2 2v8.4a2 2 0 0 1-2 2H5.6a2 2 0 0 1-2-2Z" /><circle cx="12" cy="12.8" r="3.3" /></>,
   image: <><rect x="3.6" y="4.8" width="16.8" height="14.4" rx="2.6" /><circle cx="8.6" cy="9.6" r="1.7" /><path d="m4.4 17.4 4.8-4.6 3.3 3 3-2.6 4.1 4" /></>,
   warning: <><path d="M12 3.4 21.2 19.4H2.8Z" /><path d="M12 9.6v4.4" /><circle cx="12" cy="16.6" r=".9" fill="currentColor" stroke="none" /></>,
+  phone: <><rect x="6.4" y="2.6" width="11.2" height="18.8" rx="2.6" /><path d="M10.4 5.4h3.2" /><path d="M10.8 18.4h2.4" /></>,
 }
 
 // A few keys are aliases so call sites can say what they mean.

@@ -14,13 +14,13 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
    waiting for its push does not flash it. The store is a stand-in: its `sync` is what each test
    sets; ServerSync.jsx (the words and the actions) is the real one. */
 const mocks = vi.hoisted(() => {
-  const state = { MOBILE: false, DEMO: false, webauthn: true, user: null, guest: false, onboarding: false, sync: null, sheets: [], navs: [] }
+  const state = { MOBILE: false, DEMO: false, webauthn: true, user: null, onboarding: false, sync: null, sheets: [], navs: [] }
   state.toast = vi.fn()
   state.syncNow = vi.fn(async () => state.sync)
   state.passkeyLogin = vi.fn(async () => ({ id: 'u1', name: 'andi' }))
   state.snapshot = () => ({
     user: state.user, sync: state.sync, needsMobileOnboarding: state.onboarding,
-    isGuest: () => state.guest, syncNow: state.syncNow,
+    syncNow: state.syncNow,
     setUser: vi.fn(), adoptProfile: vi.fn(async () => ({})),
   })
   return state
@@ -56,7 +56,7 @@ const network = on => {
 let host, root
 beforeEach(() => {
   network(true)
-  Object.assign(mocks, { MOBILE: false, DEMO: false, webauthn: true, user: { id: 'u1', name: 'andi' }, guest: false, onboarding: false, sync: sync('ok') })
+  Object.assign(mocks, { MOBILE: false, DEMO: false, webauthn: true, user: { id: 'u1', name: 'andi' }, onboarding: false, sync: sync('ok') })
   mocks.sheets.length = 0
   mocks.navs.length = 0
   mocks.toast.mockClear(); mocks.syncNow.mockClear(); mocks.passkeyLogin.mockClear()
@@ -209,7 +209,6 @@ describe('no server at all', () => {
   it('a phone kept local says so quietly, with a way to connect', () => {
     mocks.MOBILE = true
     mocks.user = null
-    mocks.guest = true
     mocks.sync = sync('local', { server: null })
     render()
     expect(bar().className).toContain('quiet')
@@ -219,27 +218,9 @@ describe('no server at all', () => {
     expect(openedConnect().dataset.again).toBe('false')
   })
 
-  it('a guest in a browser: "Sign in" leads to Settings, where signing in and creating a profile are', () => {
-    mocks.user = null
-    mocks.guest = true
-    mocks.sync = sync('local')
-    render()
-    expect(text()).toBe('Guest mode — data lives only in this browser.')
-    act(() => button().click())
-    expect(mocks.navs).toEqual(['/settings'])
-    expect(mocks.passkeyLogin).not.toHaveBeenCalled()
-  })
-
-  it('a browser without passkeys still hears it, with nothing to press', () => {
-    mocks.user = null
-    mocks.guest = true
-    mocks.webauthn = false
-    mocks.sync = sync('local')
-    render()
-    expect(text()).toBe('Guest mode — data lives only in this browser.')
-    expect(button()).toBeNull()
-  })
-
+  // In a browser there is no local mode to be in: every account on the instance belongs to a
+  // subscription, so nobody signed in means the sign-in screen, which is the whole app and says
+  // everything there is to say by itself.
   it('the sign-in screen of a browser nobody signed in on is left alone', () => {
     mocks.user = null
     mocks.sync = sync('local')
@@ -263,8 +244,8 @@ describe('a sign-in waiting for its question', () => {
 describe('where it never shows', () => {
   it('the public demo, which has no server by design', () => {
     mocks.DEMO = true
+    mocks.MOBILE = true
     mocks.user = null
-    mocks.guest = true
     mocks.sync = sync('local')
     render()
     expect(bar()).toBeNull()

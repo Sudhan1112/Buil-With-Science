@@ -1,7 +1,7 @@
 {
-  "name": "openGym",
-  "short_name": "openGym",
-  "description": "Personal gym & body weight tracker",
+  "name": "CareFit",
+  "short_name": "CareFit",
+  "description": "Your coach, your plan, your progress",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

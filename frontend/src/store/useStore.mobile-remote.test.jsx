@@ -163,7 +163,6 @@ describe('boot when the server refuses the pairing token', () => {
 
     expect(readFile('opengym-remote.json')).toEqual({ mode: 'remote', base: BASE, token: 'TOKEN-OLD', user: USER })
     expect(st.user).toEqual(USER)
-    expect(st.isGuest()).toBe(false)
     expect(st.sync).toMatchObject({ status: 'auth', auth: true, lastError: { status: 401, code: 'auth' }, server: BASE })
   })
 

@@ -5,7 +5,6 @@ import { t } from '../lib/i18n.js'
 import { registerCustom } from '../lib/exercises.js'
 import { DEMO, DEMO_SEEDED } from '../lib/demo.js'
 import { rememberDefaultLang } from '../lib/default-lang.js'
-import { guestAllowed } from '../lib/guest.js'
 import { MOBILE, initReminderSync, nativeLoad, nativeSave, onAppActive, readJsonFile, syncReminder, writeAutoBackup, writeJsonFile } from '../lib/mobile.js'
 import { mergeStates, localExtras, stampRoutines, stampCustomEx, inUnitOf, keepReset, resetIdsOf, mergeResetIds, entryKey } from '../lib/sync-merge.js'
 import { convertStateUnit } from '../lib/units.js'
@@ -444,6 +443,45 @@ export const useStore = create((set, get) => {
     pushPending = false
   }
 
+  // The program belongs to the coach. `routines` and `week` live in a server document of their
+  // own (plan-<uid>.json) that this client only ever reads: PUT /api/data drops both keys, so the
+  // copy that comes back from a pull or a merge has no program in it and this puts it back.
+  //
+  // Written unstamped (persist's third argument), because taking delivery of the coach's plan is
+  // a read, not a change this device made. Stamping it would make the copy look newer than the
+  // server's, push it, and get the program stripped off again on the way in — once per poll,
+  // forever.
+  // The plan rides along on the answers the sync already asks for — /api/data carries it and
+  // /api/data/rev carries its revision — so none of this costs a request of its own.
+  let planRev = 0
+  const samePlan = (S, plan) =>
+    JSON.stringify(S.routines || []) === JSON.stringify(plan.routines || []) &&
+    JSON.stringify(S.week || {}) === JSON.stringify(plan.week || {})
+  // `res` is whatever /api/data (or /api/plan) answered. Tolerates not being given one at all:
+  // it is called on pullState's failed path too, where the copy on the device — program and
+  // all — is simply the one that stays.
+  const applyPlan = res => {
+    const plan = res?.plan
+    // `_rev` counts the coach's writes, so 0 means nothing has ever been assigned to this
+    // account — a client waiting on its first plan, not an instruction to empty the copy it
+    // holds. Only a plan the coach has actually written replaces what is on the device.
+    if (!plan || !(plan._rev > 0)) return
+    planRev = plan._rev
+    set({ plan: { ...plan, published: !!res.planPublished } })
+    if (samePlan(get().S, plan)) return
+    persist({ ...get().S, routines: clone(plan.routines || []), week: clone(plan.week || {}) }, false, false)
+  }
+  // Off the sync path: the gate and the admin's own screens ask for the plan directly.
+  const hydratePlan = async () => {
+    if (!get().user) return
+    try { applyPlan(await api('/api/plan')) }
+    catch (e) {
+      // 402 (nothing paid for yet) is the gate screen's business and an unreachable server is
+      // the sync banner's. Either way the program already on the device stays on it.
+      if (e.status === 402) set({ plan: null })
+    }
+  }
+
   // A signed-in device shows what the server has. Coming back — to the tab, the window, the app,
   // the network — and every half minute while open, it asks the server for its revision (one
   // small GET) and fetches the document only when the number moved; a change still owed to the
@@ -461,8 +499,10 @@ export const useStore = create((set, get) => {
     const { base } = metaOf()
     if (!base || owes()) return get().pullState()
     try {
-      const { rev } = await api('/api/data/rev')
-      if (rev !== base.rev) return get().pullState()
+      const { rev, planRev: served } = await api('/api/data/rev')
+      // A plan published while this device sat open moves the same poll as everything else: the
+      // pull that follows carries it. Servers from before the coaching split send no `planRev`.
+      if (rev !== base.rev || (served != null && served !== planRev)) return get().pullState()
       confirmed(get().S)   // nothing moved on either side
     } catch (e) {
       if (isNetworkError(e) || refused(e)) failed(e)
@@ -1064,12 +1104,24 @@ export const useStore = create((set, get) => {
       if (MOBILE && S.autoBackup) writeAutoBackup(S)
     },
 
-    isGuest: () => localStorage.getItem('gym_guest') === '1',
-    // Choosing to go on without a server ends whatever was said about the last one.
-    setGuest(v) {
-      if (v) localStorage.setItem('gym_guest', '1'); else localStorage.removeItem('gym_guest')
-      set({})
-      if (v) setSync({ auth: false, offline: false, lastError: null })
+    // Dropping back to a server-less copy of the app — what the mobile build does when it is
+    // not paired to anything. There is no entrance here on the web: every account on this
+    // instance belongs to a subscription, and a profile with no server behind it is one no
+    // coach could ever write a plan into.
+    goLocal() { setSync({ auth: false, offline: false, lastError: null }) },
+
+    // The coach's program as the server last served it, with its metadata (who revised it, when,
+    // the note that came with it). `routines`/`week` are mirrored into S so every screen reads
+    // them where it always did; this is what the screens that talk *about* the plan read.
+    // null until the first successful fetch, and again whenever the account stops being paid for.
+    plan: null,
+    // Subscription, intake and open plan request, as /api/me reports them. The gate reads this to
+    // decide whether to show the app at all, so it is refreshed on every sign-in and boot.
+    account: null,
+    refreshPlan: () => hydratePlan({ force: true }),
+    async refreshAccount() {
+      try { const me = await api('/api/me'); set({ account: me.account || null }); return me.account }
+      catch { return null }
     },
 
     // Public config from /api/config (invite_only, allow_guest). null until the first successful
@@ -1143,7 +1195,12 @@ export const useStore = create((set, get) => {
         // nothing on this path waits for the answer. A copy that has the key was made for a
         // session and is already the right answer, Coach or no Coach.
         if (get().config && !('coach' in get().config)) get().refreshConfig()
-      } else { rejoined = false; adoptHold = false; localStorage.removeItem('gym_user') }
+      } else {
+        rejoined = false; adoptHold = false; localStorage.removeItem('gym_user')
+        // Nothing about the account that just left may show through to whoever signs in next.
+        planRev = -1
+        set({ plan: null, account: null })
+      }
       set({ user: u })
       setSync({ held: adoptHold })
     },
@@ -1169,11 +1226,12 @@ export const useStore = create((set, get) => {
     async pullState() {
       if (adoptHold) return   // as pushState: adoptProfile reads the server itself
       if (pulling) return pulling
+      let data = null
       pulling = (async () => {
         try {
           if (pushTm) { clearTimeout(pushTm); pushTm = null; await get().pushState() }
           else if (pushing) await pushing
-          const res = await api('/api/data')
+          const res = data = await api('/api/data')
           lastCheck = Date.now()
           reached()
           const { state, rev } = res
@@ -1209,7 +1267,10 @@ export const useStore = create((set, get) => {
           pushPending = false
           await get().pushState()
         } catch (e) { failed(e) /* keep local; the poll retries */ }
-        finally { pulling = null }
+        // Last, and after every branch above: any of them may have replaced the copy in hand
+        // with the server's, which has no program in it (PUT /api/data strips one, so what is
+        // stored never had one). This is where the coach's program goes back on.
+        finally { applyPlan(data); pulling = null }
       })()
       return pulling
     },
@@ -1354,7 +1415,7 @@ export const useStore = create((set, get) => {
       await forgetRemote()
       pairedBase = null
       setSync({ server: null })
-      get().setGuest(true)
+      get().goLocal()
       set({ ready: true })
       return r
     },
@@ -1406,6 +1467,7 @@ export const useStore = create((set, get) => {
             // that is used at all.
             if (typeof me.token === 'string' && me.token) await renewToken(remote, me.token)
             get().setUser(me.user)
+            set({ account: me.account || null })
             // The paired server's /api/config, the same one the web boot reads: without it the
             // phone never learned whether the server offers the Coach and told everyone "your
             // server has no Coach enabled" — with the admin looking at a green test.
@@ -1452,7 +1514,7 @@ export const useStore = create((set, get) => {
           // again; the address is gone, so pairing asks for it.
           markOwed(true)
           failed({ status: 0, code: 'not-paired' }, { pending: true })
-        } else get().setGuest(true)
+        } else get().goLocal()
         syncReminder(get().S)
         // Only a genuinely first launch — nothing chosen yet and nothing to lose either — offers
         // the choice. Picking local (even with no data yet) persists that choice below and this
@@ -1466,7 +1528,7 @@ export const useStore = create((set, get) => {
           localStorage.setItem(DEMO_SEEDED, '1')
           await get().resetDemo()
         }
-        get().setGuest(true)
+        get().goLocal()
         finishBoot()
         return
       }
@@ -1475,12 +1537,7 @@ export const useStore = create((set, get) => {
       // here for the sheet that redeems it (App.jsx, components/Passkeys.jsx).
       const linkCode = linkTokenFromSearch(window.location.search)
       if (linkCode) { stripLinkFromUrl(); set({ linkCode }) }
-      // Guests never authenticate, so an instance that turned guest mode off has no request to
-      // refuse — the only way the switch reaches someone already inside is here, on their next
-      // boot. Ending the session needs a positive `allow_guest: false`; see lib/guest.js for why
-      // an unreachable server must not be allowed to lock anyone out (#42).
-      const cfg = await get().loadConfig()
-      if (!guestAllowed(cfg)) get().setGuest(false)
+      await get().loadConfig()
       // A sign-out that could not reach the server: finish it first. Still unanswered, the
       // browser stays signed out rather than adopt the session it left behind.
       if (logoutOwed()) {
@@ -1491,6 +1548,7 @@ export const useStore = create((set, get) => {
         const me = await api('/api/me')
         if (!me.user?.id) throw Object.assign(new Error('no user'), { status: 200, code: 'bad-response' })
         get().setUser(me.user)
+        set({ account: me.account || null })
         // Re-stamp the reminder's timezone on every load — keeps it correct if you're travelling,
         // without needing to revisit Settings.
         const restampTz = () => {
@@ -1513,10 +1571,9 @@ export const useStore = create((set, get) => {
         // The session ended (expired, revoked, signed out everywhere): back to the sign-in
         // screen, which says so. The copy stays here with its owner, and signing in again as the
         // same account merges it (adoptProfile). A later reload still says so while that copy
-        // owes its account changes — the user is gone by then, the owner and the copy are not —
-        // unless whoever is here chose to go on as a guest.
+        // owes its account changes — the user is gone by then, the owner and the copy are not.
         if (e.status === 401) {
-          const kept = !!get().user || (!get().isGuest() && !!localStorage.getItem('gym_owner') && owes())
+          const kept = !!get().user || (!!localStorage.getItem('gym_owner') && owes())
           get().setUser(null)
           if (kept) failed(e, { pending: owes() })
         }

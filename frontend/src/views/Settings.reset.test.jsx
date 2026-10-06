@@ -82,6 +82,7 @@ afterEach(() => {
   host.remove()
 })
 
+const coach = { uid: 'u1', name: 'Ana', admin: true }
 const mount = () => act(() => root.render(<Settings />))
 const resetRow = () => [...host.querySelectorAll('.lrow')].find(r => r.textContent.includes('Reset everything'))
 const openDialog = () => {
@@ -91,22 +92,19 @@ const openDialog = () => {
 }
 const serverForgetCalls = () => mocks.api.mock.calls.filter(([path]) => path === '/api/coach/forget')
 
+// Wiping a profile is the coach's, not the client's: a client's record is what the coaching is
+// built on, and starting over is a conversation rather than a button (views/Settings.jsx,
+// "Data"). So every case here signs in as one — there is no row at all otherwise, which the
+// last test pins.
 describe('Settings — reset everything', () => {
-  it('guest: says the wipe is local, resets to the defaults, never calls the Coach', () => {
+  it('a client is not offered it at all', () => {
+    mocks.user = { uid: 'u1', name: 'Ana' }
     mount()
-    const dialog = openDialog()
-    expect(dialog.title).toBe('Reset everything?')
-    expect(dialog.message).toBe('Deletes your plan, workouts, body weight, photos and videos on this device. This cannot be undone.')
-    act(() => { dialog.onConfirm() })
-    // the store's reset: the empty copy, stamped (useStore resetEverything)
-    expect(mocks.resetEverything).toHaveBeenCalledTimes(1)
-    expect(serverForgetCalls()).toHaveLength(0)
-    expect(mocks.forgetCoach).not.toHaveBeenCalled()
-    expect(mocks.toast).toHaveBeenCalledWith('All data reset')
+    expect(resetRow()).toBeUndefined()
   })
 
-  it('signed in: says the wipe reaches the server and every device, and forgets the Coach on the server too', () => {
-    mocks.user = { uid: 'u1', name: 'Ana' }
+  it('says the wipe reaches the server and every device, and forgets the Coach on the server too', () => {
+    mocks.user = coach
     mount()
     const dialog = openDialog()
     expect(dialog.message).toBe('Deletes your plan, workouts, body weight, photos and videos from your profile on this server and on every signed-in device. This cannot be undone.')
@@ -118,8 +116,8 @@ describe('Settings — reset everything', () => {
     expect(mocks.toast).toHaveBeenCalledWith('All data reset')
   })
 
-  it('signed in: a failing Coach call does not block the reset', async () => {
-    mocks.user = { uid: 'u1', name: 'Ana' }
+  it('a failing Coach call does not block the reset', async () => {
+    mocks.user = coach
     mocks.api.mockRejectedValueOnce(new Error('offline'))
     mount()
     const dialog = openDialog()
@@ -131,7 +129,7 @@ describe('Settings — reset everything', () => {
 
   // A paired phone running the Coach with its own key has Coach data in both homes.
   it('paired phone with its own key: clears the Coach on the server and on the device', () => {
-    mocks.user = { uid: 'u1', name: 'Ana' }
+    mocks.user = coach
     mocks.coachLocal = { mode: 'byok', provider: 'anthropic' }
     mount()
     const dialog = openDialog()
@@ -142,15 +140,6 @@ describe('Settings — reset everything', () => {
     expect(mocks.toast).toHaveBeenCalledWith('All data reset')
   })
 
-  it('own key, no server: clears the device Coach without touching the server', () => {
-    mocks.coachLocal = { mode: 'byok', provider: 'anthropic' }
-    mount()
-    const dialog = openDialog()
-    act(() => { dialog.onConfirm() })
-    expect(serverForgetCalls()).toHaveLength(0)
-    expect(mocks.forgetCoach).toHaveBeenCalledTimes(1)
-    expect(mocks.resetEverything).toHaveBeenCalledTimes(1)
-  })
 })
 
 describe('Settings — footer', () => {

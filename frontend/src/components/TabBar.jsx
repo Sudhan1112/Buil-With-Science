@@ -22,8 +22,7 @@ export default function TabBar({ onStart }) {
   const loc = useLocation()
   const S = useStore(s => s.S)
   const user = useStore(s => s.user)
-  const isGuest = useStore(s => s.isGuest())
-  if (!user && !isGuest) return null
+  if (!user) return null
   const cur = loc.pathname.split('/')[1] || 'home'
   const on = k => cur === k || (cur === 'history' && k === 'stats') || (cur === 'settings' && k === 'home') || (cur === 'muscles' && k === 'library') || (cur === 'structural-balance' && k === 'stats')
 
@@ -48,7 +47,13 @@ export default function TabBar({ onStart }) {
         <span>{S.active ? (cur === 'workout' ? t('Workout') : S.active.editingWorkoutId ? t('Edit workout') : t('Resume')) : t('Start')}</span>
       </button>
       <Tab active={on('stats')} icon="chart" label={t('Stats')} onClick={() => nav('/stats')} />
-      <Tab active={on('library')} icon="list" label={t('Exercises')} onClick={() => nav('/library')} />
+      {/* The exercise library used to live here. A client picks nothing — their coach writes
+          the programme — so browsing 1,324 exercises is an invitation to ask for the wrong
+          thing. What they can still reach is every exercise that is actually in their plan,
+          from the routine that holds it. The coach gets their own tab instead. */}
+      {user.admin
+        ? <Tab active={on('admin')} icon="shield" label={t('Clients')} onClick={() => nav('/admin')} />
+        : <Tab active={on('community')} icon="personCircle" label={t('Community')} onClick={() => nav('/community')} />}
     </nav>
   )
 }

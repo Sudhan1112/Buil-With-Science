@@ -35,7 +35,10 @@ const mocks = vi.hoisted(() => {
   state.stopWork = vi.fn(() => { state.work = null })
   state.storeSnapshot = () => ({
     S: state.S,
-    user: null,
+    // Adding an exercise to a session and writing a session note are the coach's (see
+    // lib/workout-controls.js), and much of this file exercises the first. Workout.client.test.jsx
+    // covers what a client's screen drops.
+    user: { id: 'u1', name: 'Ana', admin: true },
     update: mut => {
       const next = structuredClone(state.S)
       mut(next)
@@ -93,6 +96,7 @@ vi.mock('../components/Media.jsx', () => ({ default: () => null }))
 // tests rather than declaring a vitest environment, so it must not depend on an ambient one.
 vi.mock('../lib/api.js', () => ({
   api: vi.fn(() => Promise.resolve({})),
+  beacon: vi.fn(),   // the "left" signal, which only a signed-in session sends
   IS_APPLE: false, IS_ANDROID: false, BIO: 'biometrics',
 }))
 

@@ -1959,6 +1959,7 @@ function WorkoutDetail({ w, close }) {
   const onNoteFocus = useSheetKeyboard(noteRef)
   const st = useStore(s => s.S)
   const update = useStore(s => s.update)
+  const isCoach = useStore(s => !!s.user?.admin)
   // The session note is editable here rather than only at the finish sheet: what you want to
   // record about a session is often clearer once you have looked at what you actually did.
   const [note, setNote] = useState(w.note || '')
@@ -2086,8 +2087,14 @@ function WorkoutDetail({ w, close }) {
       }
     })}>{t('Save as routine')}</Button>
     <div style={{ height: 8 }} />
-    <Button icon="clipboard" onClick={copyAsText}>{t('Copy as text')}</Button>
-    <div style={{ height: 10 }} />
+    {/* "Copy as text" turns a session into a block of plain text on the clipboard, which is the
+        one tap between a coached client's record and a group chat. The coach keeps it — they
+        quote sessions back at people for a living. See views/Settings.jsx, "Data", for the rest
+        of the same rule and for why it is a product decision rather than a security boundary. */}
+    {isCoach && <>
+      <Button icon="clipboard" onClick={copyAsText}>{t('Copy as text')}</Button>
+      <div style={{ height: 10 }} />
+    </>}
     {/* Matched the way the edits above are, not by id: a workout from before ids has none, and
         filtering on `x.id !== undefined` took every other one of them with it. */}
     <Button variant="danger" onClick={() => confirmSheet({ title: t('Delete workout?'), message: t('This removes it from your history for good.') + mediaGoesToo(S().workouts.find(x => sameWorkout(x, w))), confirmText: t('Delete'), danger: true, onConfirm: () => { update(s => { s.workouts = s.workouts.filter(x => !sameWorkout(x, w)) }); close(); toast(t('Workout deleted')) } })}>{t('Delete workout')}</Button>

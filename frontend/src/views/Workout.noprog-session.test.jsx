@@ -15,7 +15,7 @@ import { lastEntryFor } from '../lib/history.js'
 import { EXDB } from '../lib/exercises.js'
 
 vi.mock('../lib/sound.js', () => ({ beep: vi.fn(), chime: vi.fn(), vibrate: vi.fn(), unlock: vi.fn() }))
-vi.mock('../lib/api.js', () => ({ api: vi.fn(() => Promise.resolve({})), appBase: () => '/' }))
+vi.mock('../lib/api.js', () => ({ api: vi.fn(() => Promise.resolve({})), beacon: vi.fn(), appBase: () => '/' }))
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
 const clone = value => JSON.parse(JSON.stringify(value))
@@ -36,7 +36,8 @@ let sheetRoot
 let sheetContainer
 
 function mount(S) {
-  useStore.setState({ S, user: null })
+  // "Add exercise" is the coach's (lib/workout-controls.js) and two cases below use it.
+  useStore.setState({ S, user: { id: 'u1', name: 'Ana', admin: true } })
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)

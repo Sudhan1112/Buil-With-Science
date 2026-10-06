@@ -48,10 +48,16 @@ test('GET/PUT /api/data: revisions, conditional writes and the legacy overwrite'
   const put = async body => { const r = await fetch(`${h.api}/api/data`, { method: 'PUT', headers: headers(uid), body: JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
   const onDisk = () => JSON.parse(fs.readFileSync(path.join(h.dataDir, `state-${uid}.json`), 'utf8'));
 
-  // nothing synced yet
+  // nothing synced yet — and no program assigned either, which this answer carries alongside
+  // the document (PUT /api/data strips `routines`/`week`, so the client reads them from here).
   let r = await get();
   assert.equal(r.status, 200);
-  assert.deepEqual(r.body, { state: null, rev: 0 });
+  assert.deepEqual(r.body, {
+    state: null,
+    rev: 0,
+    plan: { routines: [], week: {}, _rev: 0, updatedAt: null, updatedBy: null, note: '' },
+    planPublished: false,
+  });
 
   // first write against rev 0
   r = await put({ state: { _ts: 100, workouts: [{ id: 'w1', d: '2026-09-01' }], routines: [], active: { id: 'running' } }, baseRev: 0 });

@@ -38,7 +38,9 @@ beforeEach(() => {
   useUI.setState({ sheets: [], toast })
   const S = clone(DEF)
   Object.assign(S, { unit: 'kg', routines: [], workouts: [], active: null })
-  useStore.setState({ S, user: null })
+  // "Copy as text" is the coach's — it is the one tap between a client's record and a group
+  // chat (sheets.jsx, WorkoutDetail). The rest of the sheet is the same for both.
+  useStore.setState({ S, user: { id: 'u1', name: 'Ana', admin: true } })
   document.body.innerHTML = ''
 })
 afterEach(() => {
@@ -148,5 +150,13 @@ describe('workout detail', () => {
     await act(async () => { button(host, 'Copy as text').click() })
     expect(toast).toHaveBeenCalledWith('Could not copy')
     delete document.execCommand
+  })
+
+  it('is not offered to a client, who still sees the session itself', async () => {
+    useStore.setState({ user: { id: 'u2', name: 'Bo' } })
+    workoutDetailSheet(workout([{ id: lifts[0], target: { mode: 'reps' }, sets: [done(60, 5)] }]))
+    const host = mountTopSheet()
+    expect(button(host, 'Copy as text')).toBeUndefined()
+    expect(host.querySelectorAll('.wd-ex')).toHaveLength(1)
   })
 })

@@ -26,9 +26,14 @@ import TimerFlash from './components/TimerFlash.jsx'
 import { openDeviceLinkRedeem } from './components/Passkeys.jsx'
 import Login from './views/Login.jsx'
 import MobileOnboarding from './views/MobileOnboarding.jsx'
+import Gate from './views/Gate.jsx'
+import PhoneOnly, { useDesktop } from './views/PhoneOnly.jsx'
+import Community from './views/Community.jsx'
+import RoutineView from './views/RoutineView.jsx'
 import Home from './views/Home.jsx'
 import CheckIn from './views/CheckIn.jsx'
 import Plan from './views/Plan.jsx'
+import PlanEdit from './views/PlanEdit.jsx'
 import RoutineEdit from './views/RoutineEdit.jsx'
 import Workout from './views/Workout.jsx'
 import Stats from './views/Stats.jsx'
@@ -38,6 +43,7 @@ import Muscles from './views/Muscles.jsx'
 import StructuralBalance from './views/StructuralBalance.jsx'
 import Settings from './views/Settings.jsx'
 import Admin from './views/Admin.jsx'
+import AdminPlan from './views/AdminPlan.jsx'
 import CoachChat from './views/CoachChat.jsx'
 import CoachIntake from './views/CoachIntake.jsx'
 import CoachSetup from './views/CoachSetup.jsx'
@@ -70,8 +76,19 @@ function Shell() {
   useEffect(() => { setPlayOnSilent(!!S.soundOnSilent) }, [S.soundOnSilent])
   // Settings → Vibrate, the same way: one page-level switch rather than a check at each buzz.
   useEffect(() => { setVibrate(S.vibrate !== false) }, [S.vibrate])
-  const isGuest = useStore(s => s.isGuest())
   const needsMobileOnboarding = useStore(s => s.needsMobileOnboarding)
+  // The app is sold a month at a time, and an account between months sees the gate instead of
+  // the dashboard. Only a view: the API answers every data route of an unpaid account with 402
+  // on its own, so there is nothing behind this screen to reach. Admins are never gated, and
+  // neither is an account whose state has not arrived yet — a slow or unreachable server must
+  // not read as "not paid" and lock somebody out of a dashboard they have paid for.
+  const account = useStore(s => s.account)
+  const locked = !!user && !user.admin && !!account && account.sub?.status !== 'active'
+  // The coach's portal works at any width; a client's side is a phone app and says so on a
+  // laptop (views/PhoneOnly.jsx). The sign-in screen is exempt — somebody has to be able to
+  // read the address they were sent before we can know whether they are a client.
+  const onDesktop = useDesktop()
+  const wrongScreen = !!user && !user.admin && onDesktop
   const langV = useLang()   // re-renders the whole shell when the language (pack) changes
   useEffect(() => { setNav(navigate) }, [navigate])
   const lastEditPath = useRef(loc.pathname)
@@ -158,8 +175,7 @@ function Shell() {
   // bound to the workout, not to the route — checking Stats mid-session keeps the screen on
   useWakeLock(!!S.active && !S.active.editingWorkoutId && S.keepAwake !== false)
 
-  const authed = user || isGuest
-  if (!ready && !authed) return (
+  if (!ready && !user) return (
     <div id="app">
       <div style={{ paddingTop: '44vh', display: 'flex', justifyContent: 'center', fontSize: 34, color: 'var(--label-3)' }}>
         <Icon name="dumbbell" />
@@ -173,18 +189,27 @@ function Shell() {
           re-mounts the boundary, so the tab bar is always a way out */}
       <div id="app" className="vfade" key={loc.pathname}>
         <ErrorBoundary>
-          {!authed ? <Login /> : needsMobileOnboarding ? <MobileOnboarding /> : (
+          {!user ? <Login /> : needsMobileOnboarding ? <MobileOnboarding /> : wrongScreen ? <PhoneOnly /> : locked ? <Gate /> : (
             <Routes>
               <Route path="/home" element={<Home />} />
               {/* Gym check-in — switched off in Settings, the route falls through to the
                   catch-all redirect below. */}
-              {S.checkIn !== false && <Route path="/checkin" element={<CheckIn />} />}
-              <Route path="/plan" element={<Plan />} />
-              <Route path="/plan/r/:id" element={<RoutineEdit />} />
+              {/* Gym check-in (QR membership cards) is a feature of the gym, not of the
+                  coaching. Only the coach, who may well run one, still has it. */}
+              {user.admin && S.checkIn !== false && <Route path="/checkin" element={<CheckIn />} />}
+              {/* The coach writes the programme, the client reads it. */}
+              <Route path="/plan" element={user.admin ? <PlanEdit /> : <Plan />} />
+              {/* A client reads their routine; the coach edits it. Same path, because a
+                  deep link out of a notification should land somewhere useful for either. */}
+              <Route path="/plan/r/:id" element={user.admin ? <RoutineEdit /> : <RoutineView />} />
+              <Route path="/community" element={<Community />} />
               <Route path="/workout" element={<Workout />} />
               <Route path="/stats" element={<Stats />} />
               <Route path="/history" element={<History />} />
-              <Route path="/library" element={<Library />} />
+              {/* Browsing all 1,324 exercises is the coach's job — a client picks nothing, so
+                  the library would only invite them to ask for the wrong thing. Every exercise
+                  that is actually in their plan is still one tap away, from the routine. */}
+              <Route path="/library" element={user.admin ? <Library /> : <Navigate to="/home" replace />} />
               <Route path="/muscles" element={<Muscles />} />
               <Route path="/structural-balance" element={<StructuralBalance />} />
               <Route path="/settings" element={<Settings />} />
@@ -196,6 +221,9 @@ function Shell() {
               <Route path="/coach/proposal" element={<Navigate to="/coach" replace />} />
               <Route path="/coach/setup" element={<CoachSetup />} />
               <Route path="/admin" element={user?.admin ? <Admin /> : <Navigate to="/home" replace />} />
+              {/* Writing one client's programme. A route rather than a sheet: it is a
+                  sitting-down job, and it wants the whole screen. */}
+              <Route path="/admin/client/:id/plan" element={user?.admin ? <AdminPlan /> : <Navigate to="/home" replace />} />
               <Route path="*" element={<Navigate to="/home" replace />} />
             </Routes>
           )}
@@ -205,8 +233,9 @@ function Shell() {
           would ride along with the page for the length of it. Decides for itself when to show —
           including on the sign-in screen, when the server has just ended the session. */}
       <SyncBanner />
-      {/* The chat owns the bottom of the screen: its composer sits where the tabs would be. */}
-      {loc.pathname !== '/coach' && <TabBar onStart={startFlow} />}
+      {/* The chat owns the bottom of the screen: its composer sits where the tabs would be.
+          The gate has nowhere to navigate to — every tab behind it is 402. */}
+      {loc.pathname !== '/coach' && !locked && !wrongScreen && <TabBar onStart={startFlow} />}
       <RestTimer />
       <Modals />
       <Toast />

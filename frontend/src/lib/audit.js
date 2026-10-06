@@ -53,14 +53,32 @@ const LABELS = {
   'auth.proof.fail': 'Confirming a change failed',
   // The password throttle paused an address; `msg` says for what (password, signup).
   'auth.throttled': 'Too many failed attempts from one address',
+  // One subscription, one device. The first sign-in binds the account to the device it came
+  // from; every later one from anywhere else is refused until the coach releases the binding.
+  'auth.device.bound': 'Account bound to a device',
+  'auth.device.blocked': 'Sign-in refused from a second device',
+  // What the client told the coach about themselves; `msg` is the goal they picked.
+  'client.intake': 'Filled in their goals and details',
+  'client.request': 'Asked their coach for a plan',
   'admin.user.disable': 'Disabled an account',
   'admin.user.enable': 'Re-enabled an account',
   'admin.user.delete': 'Deleted an account',
+  // Coach access handed to a second person, or taken back. The owner's to give; see isOwner in
+  // api/server.js for why no other admin can.
+  'admin.role.grant': 'Made someone a coach',
+  'admin.role.revoke': 'Removed coach access',
   'admin.password.reset': 'Issued a password reset code',
   'admin.invite.create': 'Created an invite code',
   'admin.invite.revoke': 'Revoked an invite code',
   'admin.audit.clear': 'Cleared the activity log',
   'admin.denied': 'Blocked from the admin dashboard',
+  // The coaching relationship: the program the coach assigned, what they did with a client's
+  // request, a subscription they activated, extended or ended, and a device binding they freed.
+  'admin.plan.write': "Wrote a client's plan",
+  'admin.request.resolve': 'Answered a plan request',
+  'admin.subscription': 'Changed a subscription',
+  'admin.device.release': 'Released a device binding',
+  'admin.post.delete': "Removed someone's community post",
   // Photos and videos of custom exercises: "Reset everything" clearing a profile's files, and the
   // upload or clean-up throttle pausing a profile (`msg` says which).
   'media.sweep': 'Cleared unused photos and videos',

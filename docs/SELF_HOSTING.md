@@ -495,6 +495,35 @@ on, `audit.log` with everyone's sign-in times. Worth knowing before you ship the
 backup service you don't run. Restore by unpacking it back into the project folder. (Individual
 users can also export their own data as JSON from Settings.)
 
+### Nightly, off the box
+
+`scripts/backup.sh` is the line above with the parts that make it a backup rather than a copy:
+it writes under a temp name and moves it into place, reads the archive back to prove it is not
+truncated, keeps the last `BACKUP_KEEP` locally (14 by default), and hands the new one to
+`rclone` if `BACKUP_REMOTE` is set. Taking it against a running instance is safe — the server
+writes every file with temp-then-rename, so each one in the archive is a complete version of
+itself.
+
+```bash
+rclone config                                     # once: pick S3, B2, Drive, SFTP…
+crontab -e
+0 3 * * * BACKUP_REMOTE=b2:carefit-backups /srv/carefit/scripts/backup.sh >> /var/log/carefit-backup.log 2>&1
+```
+
+Without `BACKUP_REMOTE` the snapshot sits on the same disk as the thing it is a snapshot of,
+which covers a bad deploy and nothing else. Set it. And because the archive carries the session
+secret as well as everyone's history, encrypt anything leaving a machine you own — rclone's
+`crypt` remote wraps any of the above, which is why the script hands off to rclone instead of
+uploading by itself.
+
+To restore, stop the stack, unpack over the project folder, start it again:
+
+```bash
+docker compose down
+tar xzf carefit-2026-10-06T030000.tar.gz -C /srv/carefit
+docker compose up -d
+```
+
 The photos and videos of custom exercises are in `data/uploads/`, and they are most of what makes
 the archive large. To leave them out:
 

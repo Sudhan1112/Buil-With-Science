@@ -74,9 +74,9 @@ test('a bearer token past half its lifetime gets a fresh one from /api/me; a you
   assert.equal(again.status, 200);
   assert.equal((await again.json()).token, undefined);   // brand new — nothing to renew
 
-  // Eight of ten days left: not yet.
+  // Eight of ten days left: not yet. `account` always rides along; only `token` is conditional.
   const young = await me(bearer(mint('u_phone', { daysLeft: 8 })));
-  assert.deepEqual(Object.keys(await young.json()), ['user']);
+  assert.deepEqual(Object.keys(await young.json()), ['user', 'account']);
 
   // A browser's cookie is renewed by signing in, not here.
   const cookie = await me({ Cookie: `gymsid=${mint('u_phone', { daysLeft: 1 })}` });

@@ -10,6 +10,7 @@ import { confirmSheet } from '../sheets.jsx'
 import Icon from '../components/Icon.jsx'
 import { Button } from '../components/ui.jsx'
 import AdminCoach from './AdminCoach.jsx'
+import AdminClient, { SubPill } from './AdminClient.jsx'
 import '../admin.css'
 
 // Admin-only operator dashboard (owner passkey + admin flag; guarded again server-side).
@@ -48,6 +49,10 @@ function UserDetail({ id, onChanged, close }) {
   const [d, setD] = useState(null)
   const toast = useUI(s => s.toast)
   const openSheet = useUI(s => s.openSheet)
+  // Only the owner is offered the coach-access control. The server refuses it from anyone else
+  // anyway (requireOwner); hiding it here is so a second coach is not shown a button that
+  // exists to tell them no.
+  const iAmOwner = useStore(s => !!s.user?.owner)
   useEffect(() => { api('/api/admin/user?id=' + encodeURIComponent(id)).then(setD).catch(e => toast(e.message)) }, [id])
   if (!d) return <div className="muted small">Loading…</div>
   const u = d.user
@@ -76,6 +81,11 @@ function UserDetail({ id, onChanged, close }) {
       .then(() => { toast(disabled ? 'User disabled' : 'User enabled'); onChanged(); close() })
       .catch(e => toast(e.message))
   }
+  const setRole = admin => {
+    api('/api/admin/user/role', { method: 'POST', body: JSON.stringify({ id: u.id, admin }) })
+      .then(() => { toast(admin ? u.name + ' is now a coach' : 'Coach access removed'); onChanged(); close() })
+      .catch(e => toast(e.message))
+  }
   // Password sign-in (#118): the server only sends `password` when the instance offers it. The
   // code comes back once, is shown once, and is never stored anywhere but as a hash.
   const pwInstance = typeof u.password === 'boolean'
@@ -91,7 +101,7 @@ function UserDetail({ id, onChanged, close }) {
   return <>
     <h3 className="capitalize">{u.name}</h3>
     <div className="row" style={{ gap: 6, flexWrap: 'wrap', margin: '8px 0 12px' }}>
-      {u.admin && <span className="adm-pill acc">admin</span>}
+      {u.owner ? <span className="adm-pill acc">owner</span> : u.admin && <span className="adm-pill acc">coach</span>}
       {u.disabled && <span className="adm-pill bad">disabled</span>}
       {u.invitedBy && <span className="adm-pill">invite {u.invitedBy}</span>}
       {u.password && <span className="adm-pill">password</span>}
@@ -106,6 +116,29 @@ function UserDetail({ id, onChanged, close }) {
       <div className="tile"><div className="l">Routines</div><div className="v" style={{ fontSize: '1.1rem' }}>{d.routines.length}</div></div>
       <div className="tile"><div className="l">Last sync</div><div className="v" style={{ fontSize: '.95rem' }}>{rel(d.lastSync)}</div></div>
     </div>
+    {/* Coach access. The owner's to give and take back — a second coach gets everything on this
+        side of the app except this one control, so nobody they let in can let anybody else in,
+        and nobody can remove the owner. An owner's own access is config, not data, so there is
+        nothing here to toggle for them. */}
+    {iAmOwner && !u.owner && <>
+      <button className={'btn ' + (u.admin ? 'danger' : '')} style={{ margin: '12px 0 4px' }}
+        onClick={() => confirmSheet(u.admin ? {
+          title: 'Remove ' + u.name + '’s coach access?',
+          message: 'They are signed out everywhere straight away and go back to being a client — which means the subscription gate and the one-device lock start applying to them again. Nothing of theirs is deleted.',
+          confirmText: 'Remove access',
+          danger: true,
+          onConfirm: () => setRole(false),
+        } : {
+          title: 'Make ' + u.name + ' a coach?',
+          message: 'They will see every client’s workouts, body weight and goals, and be able to write anyone’s plan, start and end subscriptions, release device locks and delete community posts. They will not be able to give coach access to anyone else, or take away yours.',
+          confirmText: 'Make them a coach',
+          onConfirm: () => setRole(true),
+        })}>
+        {u.admin ? 'Remove coach access' : 'Make them a coach'}</button>
+      <div className="adm-hint">{u.admin
+        ? 'A second coach has the full coaching side, but cannot grant coach access or change yours.'
+        : 'Only you can do this, and only you can undo it.'}</div>
+    </>}
     {!u.admin && <>
       <button className={'btn ' + (u.disabled ? 'primary' : 'danger')} style={{ margin: '12px 0 4px' }}
         onClick={() => u.disabled ? setDisabled(false)
@@ -147,6 +180,39 @@ function UserDetail({ id, onChanged, close }) {
       </div>)}
     </div> : <div className="adm-empty">No workouts logged.</div>}
   </>
+}
+
+/* ---------------------------------------------------------------- the inbox ------------------
+   Every client waiting on the coach, in the order they started waiting. This is the card the
+   coach opens the app for: a plan request is a person who has paid and is sitting there with
+   nothing to train.
+
+   Resolving happens in the client sheet, next to the plan it is about — marking something done
+   from a list is how you mark the wrong thing done. */
+function RequestsCard({ openUser, tick }) {
+  const toast = useUI(s => s.toast)
+  const [rows, setRows] = useState(null)
+  useEffect(() => { api('/api/admin/requests').then(r => setRows(r.requests)).catch(e => toast(e.message)) }, [tick])
+  const open = (rows || []).filter(r => r.status !== 'done')
+  // No card while it loads and none when the inbox is empty. Both are the common case, and an
+  // "all clear" box at the top of the dashboard is a box you learn to scroll past.
+  if (!open.length) return null
+
+  return <div className="card" style={{ borderColor: 'var(--acc)' }}>
+    <h2 style={{ margin: 0 }}>Waiting on you</h2>
+    <div className="adm-lead">Clients who have asked for a plan or a change to one. Tap to open them.</div>
+    {open.map(r => <div key={r.id} className="row between" style={{ padding: '9px 2px', borderBottom: 'var(--hair) solid var(--sep)' }}
+      onClick={() => openUser(r.userId)}>
+      <div className="grow" style={{ minWidth: 0 }}>
+        <div className="small" style={{ fontWeight: 600 }}>{r.userName}
+          {r.status === 'in_progress' && <span className="adm-pill" style={{ marginInlineStart: 6 }}>in progress</span>}
+          {!r.planReady && <span className="adm-pill bad" style={{ marginInlineStart: 6 }}>no plan yet</span>}</div>
+        <div className="dim" style={{ fontSize: '.72rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {r.note || (r.intake?.goal ? 'Goal: ' + r.intake.goal.replace(/_/g, ' ') : 'No note')}</div>
+      </div>
+      <span className="small muted" style={{ flex: 'none', marginInlineStart: 8 }}>{rel(Date.parse(r.created))}</span>
+    </div>)}
+  </div>
 }
 
 function InvitesCard({ invites, reload, inviteOnly }) {
@@ -275,20 +341,27 @@ export default function Admin() {
   useEffect(() => { if (!user?.admin) return; loadUsers(); loadInvites(); const iv = setInterval(loadUsers, 15000); return () => clearInterval(iv) }, [])
   if (!user?.admin) return null
 
-  const openUser = id => openSheet(close => <UserDetail id={id} onChanged={loadUsers} close={close} />)
+  // Two sheets, deliberately. AdminClient is the coaching one — subscription, plan, device,
+  // what they asked for — and is what a name in the list opens, because that is what the coach
+  // is there for nineteen times out of twenty. UserDetail is the instance-operator one
+  // (disable, delete, password reset) and hangs off the ⚙ beside the row.
+  const openUser = id => openSheet(close => <AdminClient id={id} onChanged={loadUsers} close={close} />)
+  const openAccount = id => openSheet(close => <UserDetail id={id} onChanged={loadUsers} close={close} />)
   const liveUsers = (users || []).filter(u => u.live)
-  const activeCount = (users || []).filter(u => u.lastSync && Date.now() - u.lastSync < 7 * 86400000).length
-  const disabledCount = (users || []).filter(u => u.disabled).length
+  const clients = (users || []).filter(u => !u.admin)
+  const unpaid = clients.filter(u => u.sub && !u.sub.legacy && u.sub.status !== 'active').length
+  const waiting = clients.filter(u => u.openRequest).length
 
   return <div className="narrow">
     <div className="hdr">
       <button className="iconbtn" onClick={() => nav('/settings')} aria-label="Back"><Icon name="chevronLeft" /></button>
-      <div style={{ flex: 1, marginInlineStart: 8 }}><h1 style={{ margin: 0 }}>Admin</h1>
-        <div className="sub">{users ? users.length + ' users · ' + activeCount + ' active this week' : usersErr ? 'Could not load' : 'Loading…'}</div></div>
+      <div style={{ flex: 1, marginInlineStart: 8 }}><h1 style={{ margin: 0 }}>Coach</h1>
+        <div className="sub">{users ? clients.length + ' client' + (clients.length === 1 ? '' : 's') + (waiting ? ' · ' + waiting + ' waiting on you' : '') : usersErr ? 'Could not load' : 'Loading…'}</div></div>
       <button className="iconbtn" onClick={() => { loadUsers(); loadInvites(); setTick(n => n + 1) }} aria-label="refresh">↻</button>
     </div>
     <div className="adm-intro">
-      Everything about running this instance: who uses it, how they get in, the AI Coach, and what has happened on it. Nothing here shows anyone's training data beyond counts.
+      Your clients and everything about running this instance. Tap a client for their
+      subscription, their plan, what they have asked for and how much of it they are doing.
     </div>
 
     {usersErr && <div className="card" role="alert" style={{ borderColor: 'var(--red)' }}>
@@ -300,11 +373,13 @@ export default function Admin() {
     </div>}
 
     <div className="tiles" style={{ marginBottom: 12 }}>
-      <div className="tile"><div className="l">Users</div><div className="v">{users ? users.length : '—'}</div></div>
+      <div className="tile"><div className="l">Clients</div><div className="v">{users ? clients.length : '—'}</div></div>
       <div className="tile"><div className="l">Training now</div><div className="v" style={{ color: liveUsers.length ? 'var(--acc)' : undefined }}>{users ? liveUsers.length : '—'}</div></div>
-      <div className="tile"><div className="l">Active 7 days</div><div className="v">{users ? activeCount : '—'}</div></div>
-      <div className="tile"><div className="l">Disabled</div><div className="v">{users ? disabledCount : '—'}</div></div>
+      <div className="tile"><div className="l">Waiting on you</div><div className="v" style={{ color: waiting ? 'var(--acc)' : undefined }}>{users ? waiting : '—'}</div></div>
+      <div className="tile"><div className="l">Not paid</div><div className="v" style={{ color: unpaid ? 'var(--red)' : undefined }}>{users ? unpaid : '—'}</div></div>
     </div>
+
+    <RequestsCard openUser={openUser} tick={tick} />
 
     {liveUsers.length > 0 && <div className="card" style={{ borderColor: 'var(--acc)' }}>
       <h2 className="row" style={{ margin: '0 0 2px', gap: 6 }}><Icon name="dot" style={{ fontSize: 10, color: 'var(--green)' }} />Training now</h2>
@@ -323,14 +398,32 @@ export default function Admin() {
     <InvitesCard invites={invites} reload={loadInvites} inviteOnly={inviteOnly} />
 
     <div className="card">
-      <h2 style={{ margin: 0 }}>Users</h2>
-      <div className="adm-lead">Everyone with a profile on this instance. Tap one to see their activity, to disable the account (nothing is deleted) or to delete it with all their data for good.</div>
+      <h2 style={{ margin: 0 }}>Everyone</h2>
+      <div className="adm-lead">
+        Tap a name for their coaching — subscription, plan, requests, device. The ⚙ beside it is
+        the account itself: disable it, delete it, or hand out a password reset code.
+      </div>
       <div className="list">
         {(users || []).map(u => <div key={u.id} className="item" onClick={() => openUser(u.id)} style={u.disabled ? { opacity: .55 } : null}>
-          <div className="grow"><div className="tt">{u.live && <Icon name="dot" style={{ fontSize: 9, color: 'var(--green)', display: 'inline-block', marginInlineEnd: 5 }} />}{u.name} {u.admin && <span className="adm-pill acc" style={{ marginInlineStart: 4 }}>admin</span>}{u.disabled && <span className="adm-pill bad" style={{ marginInlineStart: 4 }}>disabled</span>}</div>
+          <div className="grow" style={{ minWidth: 0 }}>
+            <div className="tt">{u.live && <Icon name="dot" style={{ fontSize: 9, color: 'var(--green)', display: 'inline-block', marginInlineEnd: 5 }} />}{u.name}
+              {u.admin && <span className="adm-pill acc" style={{ marginInlineStart: 4 }}>coach</span>}
+              {u.disabled && <span className="adm-pill bad" style={{ marginInlineStart: 4 }}>disabled</span>}
+              {!u.admin && <span style={{ marginInlineStart: 4 }}><SubPill sub={u.sub} /></span>}</div>
+            {/* One line that answers "is anything wrong here": waiting on me, no plan, or how
+                much of the plan they are doing. */}
+            {!u.admin && <div className="ss">
+              {u.openRequest ? 'asked for a plan' : !u.planReady ? 'no plan yet'
+                : u.adherence?.d28 == null ? 'plan has no training days'
+                  : u.adherence.d28 + '% of their plan over 28 days'}
+            </div>}
             <div className="ss">{u.live ? 'training now · ' + u.live.name : u.workouts + ' workouts' + (u.lastWorkout ? ' · last ' + fmtDate(u.lastWorkout) : '') + ' · last sync ' + rel(u.lastSync)}</div>
-            {u.email && <div className="ss" title="sign-in e-mail">{u.email}</div>}</div>
-          {u.hasPush && <Icon name="bell" title="push notifications on" style={{ fontSize: 15, color: 'var(--label-3)' }} />}<Icon name="chevronRight" className="chev" />
+            {u.email && <div className="ss" title="sign-in e-mail">{u.email}</div>}
+          </div>
+          {u.hasPush && <Icon name="bell" title="push notifications on" style={{ fontSize: 15, color: 'var(--label-3)' }} />}
+          <button className="iconbtn adm-iconbtn" aria-label={'Account settings for ' + u.name}
+            onClick={ev => { ev.stopPropagation(); openAccount(u.id) }}><Icon name="gear" /></button>
+          <Icon name="chevronRight" className="chev" />
         </div>)}
         {users && !users.length && <div className="adm-empty">No users yet.</div>}
       </div>

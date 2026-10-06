@@ -495,9 +495,16 @@ h4.sec{
 }
 .routine-list.is-reordering,.routine-list.is-reordering *{cursor:grabbing}
 .thumb{width:50px;height:50px;border-radius:9px;object-fit:cover;background:#fff;flex:none}
-/* exercise pictures are decoration inside tappable rows/cards: no save-image callout on
-   a long press and no drag ghost when a scroll starts on the picture */
-.thumb,.exmedia img{-webkit-touch-callout:none;-webkit-user-drag:none;user-select:none;-webkit-user-select:none}
+/* No save-image callout on a long press and no drag ghost when a scroll starts on a picture.
+   It began as a UI fix — exercise pictures are decoration inside tappable rows, and the iOS
+   share sheet on top of them is noise — and now covers every image the app draws, including
+   progress photos and anything posted in the community. A client's record is not theirs to take
+   out of the app, and the long-press menu was the last one-tap way out of it.
+
+   Not a security boundary: a screenshot still works, and so does the browser's own developer
+   tooling. It is the difference between a deliberate act and an accident. */
+img{-webkit-touch-callout:none;-webkit-user-drag:none}
+.thumb,.exmedia img{user-select:none;-webkit-user-select:none}
 .thumb-x{
   display:flex;align-items:center;justify-content:center;font-size:21px;
   background:var(--surface-2);color:var(--label-2);

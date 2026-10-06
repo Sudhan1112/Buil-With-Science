@@ -404,7 +404,7 @@ function streamToFile(req, file, { max, maxMB, idleMs }) {
  * profile's stored state, or null when there is none or it does not parse — the store sweeps
  * nobody it gets null for. `now` is injectable so the tests can walk the clock.
  */
-export function createMediaStore({ dir, limits, now = Date.now, readState = () => null, idleMs = 60000, log = console } = {}) {
+export function createMediaStore({ dir, limits, now = Date.now, readState = () => null, extraRefs = () => [], idleMs = 60000, log = console } = {}) {
   const L = { ...mediaLimits({}), ...(limits || {}) };
   const quotaBytes = L.quotaMB > 0 ? Math.round(L.quotaMB * MB) : 0;
   const capMB = kind => (kind === 'video' ? L.videoMB : kind === 'gif' ? L.gifMB : L.imageMB);
@@ -498,6 +498,20 @@ export function createMediaStore({ dir, limits, now = Date.now, readState = () =
     try { S = readState(uid); } catch { S = null; }
     return S && typeof S === 'object' && !Array.isArray(S) ? S : null;
   }
+  /* Everything the profile's own synced document points at, plus whatever the caller tells us
+   * is holding a file outside it. The sweeper's whole safety argument is "a file nothing points
+   * at any more", and the synced document stopped being the only thing that points at files
+   * when the community hub started attaching photos to posts: those live in db.json, so without
+   * this hook the next sweep would quietly delete the picture out from under a post. A thrown
+   * `extraRefs` is treated as unknown, and unknown means keep — the same way a missing state
+   * makes sweep() skip the profile entirely rather than guess. */
+  function refsOf(uid, S) {
+    const refs = referencedHashes(S);
+    let extra;
+    try { extra = extraRefs(uid); } catch (err) { log.error('media: extraRefs failed for', uid, err.message); return null; }
+    for (const h of extra || []) refs.add(h);
+    return refs;
+  }
 
   function noteState(uid, state) {
     const id = safe(uid);
@@ -507,7 +521,9 @@ export function createMediaStore({ dir, limits, now = Date.now, readState = () =
     const e = entry(uid);
     if (!e.hashes.size) return false;
     const marks = readMarks(e);
-    const changed = reconcile(e, referencedHashes(state), marks, now());
+    const refs = refsOf(uid, state);
+    if (!refs) return false;
+    const changed = reconcile(e, refs, marks, now());
     if (changed) writeMarks(e, marks);
     return changed;
   }
@@ -518,7 +534,8 @@ export function createMediaStore({ dir, limits, now = Date.now, readState = () =
     if (!e.hashes.size) return res;
     const S = stateOf(uid);
     if (!S) { res.skipped = true; return res; }   // never infer anything from a missing state
-    const refs = referencedHashes(S);
+    const refs = refsOf(uid, S);
+    if (!refs) { res.skipped = true; return res; }
     const marks = readMarks(e);
     const t = now();
     let changed = reconcile(e, refs, marks, t);
@@ -568,7 +585,7 @@ export function createMediaStore({ dir, limits, now = Date.now, readState = () =
 
   function markIfUnreferenced(uid, e, hash) {
     const S = stateOf(uid);
-    if (S && referencedHashes(S).has(hash)) return;
+    if (S && refsOf(uid, S)?.has(hash)) return;
     const marks = readMarks(e);
     marks[hash] = now();
     writeMarks(e, marks);

@@ -5,6 +5,9 @@ media/gif/
 # Runtime data — users, passkeys, per-user state, session secret
 data/
 
+# Snapshots of the above (scripts/backup.sh). Same contents, same reasons.
+backups/
+
 # Local config
 .env
 

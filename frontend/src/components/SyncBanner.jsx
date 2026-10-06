@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore } from '../store/useStore.js'
 import { DEMO } from '../lib/demo.js'
+import { MOBILE } from '../lib/mobile.js'
 import { connectionView, actionLabel, syncNowWithToast, pairAgain, connectServer, signInAgain, useOnline } from './ServerSync.jsx'
 import Icon from './Icon.jsx'
 
@@ -25,7 +26,6 @@ export default function SyncBanner() {
   const nav = useNavigate()
   const user = useStore(s => s.user)
   const sync = useStore(s => s.sync)
-  const guest = useStore(s => s.isGuest())
   const onboarding = useStore(s => s.needsMobileOnboarding)
   const online = useOnline()
   const [waited, setWaited] = useState(false)
@@ -40,8 +40,10 @@ export default function SyncBanner() {
 
   const view = connectionView(sync, { online })
   // Signed out on the web, the sign-in screen is the whole app: it hears only that the server
-  // ended the session, and that the changes are still here.
-  const show = !DEMO && !onboarding && !!view?.banner && (!!user || guest || status === 'auth') && (status !== 'pending' || waited)
+  // ended the session, and that the changes are still here. A phone with nobody signed in is a
+  // different thing — it is running local-only on purpose, and that is what it says.
+  const heard = !!user || status === 'auth' || (MOBILE && status === 'local')
+  const show = !DEMO && !onboarding && !!view?.banner && heard && (status !== 'pending' || waited)
 
   useLayoutEffect(() => {
     const root = document.documentElement

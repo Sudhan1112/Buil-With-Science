@@ -1,12 +1,12 @@
-// @vitest-environment happy-dom
-// PR #286 put the routine rows inside SwipeToDelete. The rows used to be tappable() — a button to
-// the keyboard, opened with Enter or Space — and the swipe must not take that away, nor leave a
+﻿// @vitest-environment happy-dom
+// PR #286 put the routine rows inside SwipeToDelete. The rows used to be tappable() â€” a button to
+// the keyboard, opened with Enter or Space â€” and the swipe must not take that away, nor leave a
 // delete button in the tab order that nobody can see.
 import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useStore } from '../store/useStore.js'
-import Plan from './Plan.jsx'
+import Plan from './PlanEdit.jsx'
 
 const nav = vi.fn()
 vi.mock('react-router-dom', () => ({ useNavigate: () => nav }))

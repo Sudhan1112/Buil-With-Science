@@ -144,7 +144,7 @@ test('PUT /api/data: an array is not a document, and null entries never reach th
   assert.equal(onDisk()._rev, 1);
   assert.deepEqual(onDisk().workouts.map(w => w.id), ['w1']);
   r = await status(h, 'GET', '/api/data/rev', authed);
-  assert.deepEqual(r.body, { rev: 1 });
+  assert.deepEqual(r.body, { rev: 1, planRev: 0 });
 
   // Null and other non-object entries are dropped: every server-side reader of the document
   // (reminder tick, admin drill-down) dereferences the entries, and a 400 would strand a client
@@ -153,7 +153,9 @@ test('PUT /api/data: an array is not a document, and null entries never reach th
   assert.equal(r.status, 200);
   assert.equal(r.body.rev, 2);
   assert.deepEqual(onDisk().workouts.map(w => w.id), ['w2', 'w3']);
-  assert.deepEqual(onDisk().routines.map(x => x.id), ['r1']);
+  // `routines` is the coach's to write (plan-<uid>.json), so a client that pushes one is not
+  // refused — it is simply dropped, and nothing of it reaches the profile document.
+  assert.equal('routines' in onDisk(), false);
   // Absent lists stay absent — every client fills its own defaults.
   r = await put({ state: { unit: 'kg' }, baseRev: 2 });
   assert.equal(r.status, 200);

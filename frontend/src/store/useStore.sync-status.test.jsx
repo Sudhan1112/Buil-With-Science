@@ -141,19 +141,20 @@ describe('the web boot', () => {
     expect(ids(useStore.getState().S.workouts)).toEqual(['w1'])
     expect(localStorage.getItem('gym_owner')).toBe(USER.id)
     expect(useStore.getState().sync).toMatchObject({ status: 'auth', lastError: { status: 401 } })
-    useStore.getState().setGuest(true)   // "Continue without account"
+    useStore.getState().goLocal()
     expect(useStore.getState().sync.status).toBe('local')
   })
 
-  it('a reload after that still says so while the copy owes its account changes — not once a guest chose to go on', async () => {
+  it('a reload after that still says so while the copy owes its account changes', async () => {
     useStore.setState({ S: { ...clone(DEF), _ts: 100, workouts: [workout('w1')] } })
     localStorage.setItem('gym_dirty', '1')
     await boot(() => { throw httpError(401) }, null)
     expect(useStore.getState().sync).toMatchObject({ status: 'auth', pending: true, lastError: { status: 401 } })
 
-    useStore.getState().setGuest(true)
+    // And on the next reload too: there is no entrance left that lets whoever is here go on
+    // without the account, so what that account is owed stays said until it is signed in again.
     await boot(() => { throw httpError(401) }, null)
-    expect(useStore.getState().sync.status).toBe('local')
+    expect(useStore.getState().sync).toMatchObject({ status: 'auth', pending: true })
   })
 
   it('a reload with nothing owed is simply signed out', async () => {

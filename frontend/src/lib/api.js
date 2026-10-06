@@ -2,6 +2,7 @@
 import { t } from './i18n-core.js'
 import { MOBILE } from './mobile.js'
 import { appBase } from './app-base.js'
+import { deviceId } from './device.js'
 
 export const IS_APPLE = /iPhone|iPad|iPod|Macintosh/.test(navigator.userAgent)
 export const IS_ANDROID = /Android/.test(navigator.userAgent)
@@ -214,7 +215,7 @@ export function apiUpload(path, blob, mime, { onProgress, idleMs = 60000, XHR = 
 // so it talks straight to the server the user typed in, no Authorization header.
 export async function pairRedeem(serverBase, code) {
   const data = await request(serverBase + '/api/pair/redeem', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code })
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code, deviceId: deviceId() })
   }, TIMEOUT_GET_MS)
   // Anything that is not a pairing would be saved as one — and the phone would then send every
   // change to a server that never gave it a token.
@@ -258,7 +259,7 @@ function credToJSON(cred) {
 export async function passkeyRegister(name, code) {
   const { cid, options } = await api('/api/register/options', { method: 'POST', body: JSON.stringify({ name, code: code || '' }) })
   const cred = await navigator.credentials.create({ publicKey: toCreationOptions(options) })
-  const res = await api('/api/register/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred) }) })
+  const res = await api('/api/register/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred), deviceId: deviceId() }) })
   return res.user
 }
 // One passkey ceremony, not yet sent anywhere: /api/login/verify turns it into a sign-in, and
@@ -271,7 +272,7 @@ export async function passkeyAssertion({ signal } = {}) {
   return { cid, credential: credToJSON(cred) }
 }
 export async function passkeyLogin() {
-  const res = await api('/api/login/verify', { method: 'POST', body: JSON.stringify(await passkeyAssertion()) })
+  const res = await api('/api/login/verify', { method: 'POST', body: JSON.stringify({ ...await passkeyAssertion(), deviceId: deviceId() }) })
   return res.user
 }
 // A creation ceremony on options the server has already handed out: another passkey for a
@@ -292,13 +293,13 @@ const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(bo
 // the server matches against the profile's sign-in e-mail when it holds an "@" and against the
 // name otherwise — so the app and a server a version apart still understand each other.
 export async function passwordLogin(name, password) {
-  return (await post('/api/login/password', { name, password })).user
+  return (await post('/api/login/password', { name, password, deviceId: deviceId() })).user
 }
 // `email` is optional, and sent only when there is one: a server from before the field would
 // otherwise ignore it without a word, which is the same thing.
 export async function passwordRegister(name, password, code, email) {
-  return (await post('/api/register/password', { name, password, code: code || '', ...(email ? { email } : {}) })).user
+  return (await post('/api/register/password', { name, password, code: code || '', deviceId: deviceId(), ...(email ? { email } : {}) })).user
 }
 export async function passwordResetRedeem(name, code, next) {
-  return (await post('/api/login/password-reset', { name, code, next })).user
+  return (await post('/api/login/password-reset', { name, code, next, deviceId: deviceId() })).user
 }

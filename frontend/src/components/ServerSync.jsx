@@ -8,6 +8,7 @@ import { useUI } from '../store/useUI.js'
 import { t } from '../lib/i18n.js'
 import { fmtAgo, changeCount } from '../lib/format.js'
 import { passkeyLogin, webauthnOK } from '../lib/api.js'
+import { reportSignInError } from './DeviceLocked.jsx'
 import { MOBILE } from '../lib/mobile.js'
 import { syncMedia } from '../lib/media-sync.js'
 import { DEMO } from '../lib/demo.js'
@@ -92,10 +93,13 @@ export function connectionView(sync, { mobile = MOBILE, online = isOnline() } = 
       return err.code === 'not-paired'
         ? { tone: 'bad', icon: 'lock', action: 'pair', line: t('This phone is not connected to a server.'), banner: t('This phone is no longer paired with your server. Your changes are kept here.') }
         : { tone: 'bad', icon: 'lock', action: 'pair', line: t('The server refuses this phone'), banner: t('Your server no longer accepts this phone. Your changes are kept here.') }
-    default:   // 'local': no server at all — chosen, so it is said quietly, but it is said
+    // 'local': no server at all. On a phone that is a choice, so it is said quietly; in a
+    // browser there is no way to choose it — every account here belongs to a subscription —
+    // so it means the session is gone and the way back is to sign in.
+    default:
       return mobile
         ? { tone: 'quiet', icon: 'lock', action: 'connect', line: t('On this phone only — not connected to a server'), banner: t('On this phone only — not connected to a server') }
-        : { tone: 'quiet', icon: 'lock', action: canSignIn() ? 'signin' : null, line: t('Guest mode — data lives only in this browser.'), banner: t('Guest mode — data lives only in this browser.') }
+        : { tone: 'quiet', icon: 'lock', action: canSignIn() ? 'signin' : null, line: t('Not signed in — data lives only in this browser.'), banner: t('Not signed in — data lives only in this browser.') }
   }
 }
 
@@ -136,7 +140,7 @@ export async function passkeySignIn() {
     st.setUser(u, { adopt: true })
     await st.adoptProfile(askAddDeviceData)
     toast(t('Welcome back, {0}', u.name))
-  } catch (e) { if (e.name !== 'NotAllowedError' && e.name !== 'AbortError') toast(e.message || t('Sign-in failed')) }
+  } catch (e) { reportSignInError(e, t('Sign-in failed')) }
 }
 
 /* ---------------------------------------------------------- leaving the server ---------------

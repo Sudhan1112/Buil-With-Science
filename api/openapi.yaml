@@ -141,6 +141,17 @@ tags:
     description: Web Push (VAPID) subscriptions, rest-timer and test pushes
   - name: activity
     description: Live-workout presence heartbeat
+  - name: coaching
+    description: >-
+      The coach-client relationship: what a client tells the coach about themselves, what they
+      are asking for, and the program the coach assigned them. A client reads their plan and
+      can never write it.
+  - name: community
+    description: >-
+      The community hub: one shared feed for everyone on the instance, plus each client's own
+      private thread with their coach. A `public` post is visible to every active subscriber;
+      a `private` one only to its author and the coach — in the feed, by id, and in the photos
+      attached to it alike.
   - name: admin
     description: Admin dashboard — requires an admin session (`ADMIN_UIDS` or `admin:true`)
   - name: media
@@ -1392,9 +1403,14 @@ paths:
         that document (0 when there is none). A client keeps the `rev` it last read or
         wrote and sends it back as `baseRev` on the next push, which lets the server
         refuse a write over a document the client never saw (see the 409 on PUT).
+
+        The coach's program rides along under `plan`. `PUT /api/data` drops `routines` and
+        `week`, so the stored document has no program in it and the client has to put one back
+        onto every copy it takes from here; sending it on this answer keeps a pull to one
+        request. Same document as `GET /api/plan`.
       responses:
         '200':
-          description: The stored state, or null, and its revision.
+          description: The stored state, or null, its revision, and the assigned plan.
           content:
             application/json:
               schema:
@@ -1407,7 +1423,14 @@ paths:
                   rev:
                     type: integer
                     description: Server revision of the stored document; 0 when there is none.
+                  plan: { $ref: '#/components/schemas/Plan' }
+                  planPublished:
+                    type: boolean
+                    description: >-
+                      Whether the coach has assigned anything yet — false for an account still
+                      waiting on its first plan.
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
     put:
       tags: [data]
       operationId: putData
@@ -1495,9 +1518,156 @@ paths:
         The `rev` that `GET /api/data` would return, without the document. Signed-in clients poll
         this while open and on every return to the foreground and fetch the document only when
         the number changed.
+
+        `planRev` is the same thing for the assigned plan, carried here for the same reason: a
+        plan the coach published a minute ago has to reach the client's next poll, and a second
+        round trip for a number that moves a few times a month is not worth making every half
+        minute. A client that sees either number move pulls `GET /api/data`, which carries both.
       responses:
         '200':
-          description: The current revision (0 when the profile has no state yet).
+          description: The current revisions (0 when the profile has no state, or no plan, yet).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rev: { type: integer }
+                  planRev: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+
+  /api/intake:
+    post:
+      tags: [coaching]
+      operationId: submitIntake
+      summary: Tell the coach what you want and what you are working with
+      description: |
+        Answered by an unpaid session on purpose: this is the form a client fills in *while*
+        their payment is being confirmed, so gating it behind an active subscription would hand
+        the coach a paid account with nothing to write a plan from. Replaces the stored answers
+        wholesale. Only `goal` is required; every other field is optional and simply absent when
+        not sent. Audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Intake' }
+      responses:
+        '200':
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  intake: { $ref: '#/components/schemas/Intake' }
+        '400':
+          description: No recognised `goal`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "a goal is required" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/plan-request:
+    get:
+      tags: [coaching]
+      operationId: getPlanRequest
+      summary: Your open request, if you have one
+      description: >-
+        What Home shows as "your coach is on it". `null` once the coach marks the request done.
+      responses:
+        '200':
+          description: The open request, or null.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  request:
+                    oneOf:
+                      - $ref: '#/components/schemas/PlanRequest'
+                      - type: 'null'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [coaching]
+      operationId: createPlanRequest
+      summary: Ask the coach for a plan, or for a change to the one you have
+      description: |
+        Open to an unpaid session, like the intake form, and for the same reason. A client has
+        at most one open request: asking again edits the one already on the coach's desk rather
+        than queueing a second card for them to work out the ordering of. `goal` falls back to
+        the goal on the stored intake when it is not sent. Audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                kind:
+                  type: string
+                  enum: [new, change]
+                  default: new
+                goal: { $ref: '#/components/schemas/Goal' }
+                message: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Filed, or the open one updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  request: { $ref: '#/components/schemas/PlanRequest' }
+        '400':
+          description: No goal sent and none on file.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "a goal is required" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/plan:
+    get:
+      tags: [coaching]
+      operationId: getPlan
+      summary: The program your coach assigned you (read-only)
+      description: |
+        Served from `plan-<uid>.json`, which only the admin routes write. It is kept out of the
+        synced document precisely so that the one route a client *can* write (`PUT /api/data`)
+        cannot reach it — that route drops `routines` and `week` on the way in. Rescheduling a
+        session to another date (`dayPlan`) stays in the client's own document, because that is
+        rescheduling rather than programming.
+      responses:
+        '200':
+          description: The assigned plan. An unpublished one is empty with `published: false`.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plan: { $ref: '#/components/schemas/Plan' }
+                  rev: { type: integer }
+                  published:
+                    type: boolean
+                    description: Whether the coach has published anything yet.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+
+  /api/plan/rev:
+    get:
+      tags: [coaching]
+      operationId: getPlanRev
+      summary: Current revision of your assigned plan
+      description: >-
+        Polled next to `GET /api/data/rev`, so a client picks up a newly published plan without
+        refetching the whole thing.
+      responses:
+        '200':
+          description: The current revision (0 when nothing has been published).
           content:
             application/json:
               schema:
@@ -1505,6 +1675,439 @@ paths:
                 properties:
                   rev: { type: integer }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+
+  /api/admin/plan:
+    get:
+      tags: [admin]
+      operationId: adminGetPlan
+      summary: 'Admin: read one client''s assigned plan'
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: The plan as stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  plan: { $ref: '#/components/schemas/Plan' }
+                  user:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      name: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NoSuchUser' }
+    put:
+      tags: [admin]
+      operationId: adminPutPlan
+      summary: 'Admin: write one client''s assigned plan'
+      description: |
+        The only writer of a plan file. `baseRev` guards two admin tabs against overwriting each
+        other, the same way it guards two client devices on `PUT /api/data`. Entries of
+        `routines` that are not objects are dropped rather than refused. Audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, plan]
+              properties:
+                id: { type: string, description: The client's user id. }
+                plan: { $ref: '#/components/schemas/Plan' }
+                baseRev:
+                  oneOf: [{ type: integer }, { type: 'null' }]
+                  description: The revision this editor last read. Omit for an unconditional write.
+      responses:
+        '200':
+          description: Written.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  plan: { $ref: '#/components/schemas/Plan' }
+        '400':
+          description: '`plan` missing or not an object.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "plan required" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NoSuchUser' }
+        '409':
+          description: '`baseRev` is not the current revision — another editor wrote since.'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, const: conflict }
+                  rev: { type: integer }
+                  plan: { $ref: '#/components/schemas/Plan' }
+
+  /api/admin/user/subscription:
+    post:
+      tags: [admin]
+      operationId: adminSetSubscription
+      summary: 'Admin: confirm a payment, extend access, or end it'
+      description: |
+        There is no payment provider in the loop: the coach sees the transfer against the QR on
+        the client's gate screen and records it here. `extend` on an account that still has time
+        left adds to it rather than throwing the remainder away; on a lapsed one it restarts from
+        today. Ending access never deletes anything — the profile and its plan are untouched, so
+        a later renewal restores the same dashboard. Audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, action]
+              properties:
+                id: { type: string }
+                action: { type: string, enum: [activate, extend, expire] }
+                months:
+                  type: integer
+                  minimum: 1
+                  maximum: 24
+                  default: 1
+                  description: Ignored by `expire`.
+                note: { type: string, maxLength: 300, description: e.g. the payment reference. }
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  sub: { $ref: '#/components/schemas/Subscription' }
+        '400':
+          description: Unrecognised `action`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "action must be activate, extend or expire" }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NoSuchUser' }
+
+  /api/admin/user/device/release:
+    post:
+      tags: [admin]
+      operationId: adminReleaseDevice
+      summary: 'Admin: unbind a client''s device'
+      description: |
+        A client account binds to the first device that signs in, and a second one is refused —
+        that is what stops one subscription being shared round a gym. This releases the binding,
+        so the client's next sign-in binds whatever they sign in from. Every token naming the old
+        device stops verifying the moment this writes, so the old device is signed out too. The
+        ordinary reason to use it is a client who changed phone or cleared their browser storage.
+        Audited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+      responses:
+        '200':
+          description: Released.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NoSuchUser' }
+
+  /api/admin/requests:
+    get:
+      tags: [admin]
+      operationId: adminListRequests
+      summary: 'Admin: every plan request, newest first'
+      description: >-
+        Each row carries the client's name, subscription and intake answers alongside the
+        request, so the coach can write the plan without opening another screen.
+      responses:
+        '200':
+          description: The requests.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items:
+                      allOf:
+                        - $ref: '#/components/schemas/PlanRequest'
+                        - type: object
+                          properties:
+                            userName: { type: string }
+                            sub:
+                              oneOf:
+                                - $ref: '#/components/schemas/Subscription'
+                                - type: 'null'
+                            intake:
+                              oneOf:
+                                - $ref: '#/components/schemas/Intake'
+                                - type: 'null'
+                            planReady: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/admin/requests/resolve:
+    post:
+      tags: [admin]
+      operationId: adminResolveRequest
+      summary: 'Admin: move a plan request along, with a note back to the client'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: The request id. }
+                status:
+                  type: string
+                  enum: [open, in_progress, done]
+                  default: done
+                adminNote: { type: string, maxLength: 1000 }
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  request: { $ref: '#/components/schemas/PlanRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: No request with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "no such request" }
+
+  /api/community:
+    get:
+      tags: [community]
+      operationId: getCommunity
+      summary: The feed
+      description: |
+        The 200 most recent posts the caller is allowed to see, newest first: every `public`
+        post on the instance, plus the caller's own `private` ones. An admin is the coach and
+        sees everything, which is what makes moderation and the private threads work.
+
+        `scope` narrows that list; it can never widen it, because the visibility filter runs
+        first. `mine` is the caller's own posts, `private` their thread with the coach, and
+        anything else (or nothing) is the whole feed.
+      parameters:
+        - name: scope
+          in: query
+          required: false
+          schema: { type: string, enum: [all, mine, private] }
+      responses:
+        '200':
+          description: The feed, and who the caller is in it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  posts: { type: array, items: { $ref: '#/components/schemas/Post' } }
+                  me:
+                    type: object
+                    properties:
+                      id: { type: string }
+                      name: { type: string }
+                      coach: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+    post:
+      tags: [community]
+      operationId: createPost
+      summary: Write a post
+      description: |
+        Text, up to four photos, or both — one of the two has to be there. `visibility` is
+        `public` or `private`, and anything that is not exactly the string `public` is stored
+        as private: a typo, an older client or a hand-made request all fail closed.
+
+        Photos are uploaded first through `PUT /api/media/{hash}` and named here by their
+        hash. A hash that is not 64 lowercase hex characters is dropped rather than refused,
+        so a client with one damaged entry still gets its post published.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text: { type: string, maxLength: 4000 }
+                visibility: { type: string, enum: [public, private], default: private }
+                images:
+                  type: array
+                  maxItems: 4
+                  items: { type: string, pattern: '^[0-9a-f]{64}$' }
+      responses:
+        '200':
+          description: The post as it now reads.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  post: { $ref: '#/components/schemas/Post' }
+        '400':
+          description: Neither text nor a photo.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+
+  /api/community/reply:
+    post:
+      tags: [community]
+      operationId: replyToPost
+      summary: Reply to a post
+      description: |
+        Anyone who can see the post can reply to it, which for a private post means its author
+        and the coach. A post the caller may not see answers 404 and not 403 — a 403 would
+        confirm that a private post with that id exists.
+
+        A thread is capped at 500 replies.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, text]
+              properties:
+                id: { type: string }
+                text: { type: string, maxLength: 2000 }
+      responses:
+        '200':
+          description: The whole post, with the new reply on it.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  post: { $ref: '#/components/schemas/Post' }
+        '400':
+          description: Empty text, or a thread that is already full.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+        '404':
+          description: No such post, or not one this caller may see.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/community/delete:
+    post:
+      tags: [community]
+      operationId: deletePost
+      summary: Delete a post or a reply
+      description: |
+        With `replyId`, the reply; without it, the whole post and every reply under it.
+        Authors delete their own and the coach deletes anything — that is the whole of
+        moderation. A post the caller cannot see is a 404; one they can see but do not own is
+        a 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string }
+                replyId: { type: string }
+      responses:
+        '200':
+          description: Gone.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+        '403':
+          description: Someone else's post or reply, and the caller is not the coach.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: No such post or reply, or not one this caller may see.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/community/media/{hash}:
+    parameters:
+      - name: hash
+        in: path
+        required: true
+        description: The SHA-256 of the file's bytes, 64 lowercase hex characters.
+        schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+    get:
+      tags: [community]
+      operationId: getCommunityMedia
+      summary: A photo attached to a post
+      description: |
+        The one place in this API where one account reads another's file, and the only one that
+        has to authorize a read rather than answer out of the caller's own folder.
+
+        The hash alone is not a capability: it has to be attached to a post this caller is
+        allowed to see, and the bytes then come from that post's author's folder. A hash that
+        is only on a private post somebody else wrote is a 404, exactly like one that was never
+        uploaded. Same headers as `GET /api/media/{hash}`.
+      responses:
+        '200':
+          description: The file.
+          content:
+            image/jpeg: { schema: { type: string, format: binary } }
+            image/png: { schema: { type: string, format: binary } }
+            image/webp: { schema: { type: string, format: binary } }
+            image/gif: { schema: { type: string, format: binary } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
+        '404':
+          description: Not attached to any post this caller may see.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "no such file", code: "media-missing" }
 
   /api/media/{hash}:
     parameters:
@@ -1545,6 +2148,7 @@ paths:
             video/quicktime: { schema: { type: string, format: binary } }
             video/webm: { schema: { type: string, format: binary } }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
         '404':
           description: Not in the caller's folder — never uploaded, removed by the sweep, or someone else's.
           content:
@@ -1611,6 +2215,7 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
               example: { error: "the file does not match its name", code: "hash-mismatch" }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
         '403':
           description: A browser request from another origin (see *CSRF*).
           content:
@@ -1706,6 +2311,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
         '403':
           description: A browser request from another origin (see *CSRF*).
           content:
@@ -1745,6 +2351,7 @@ paths:
                   freedBytes: { type: integer }
                   usage: { $ref: '#/components/schemas/MediaUsage' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/SubscriptionRequired' }
         '403':
           description: A browser request from another origin (see *CSRF*).
           content:
@@ -2112,6 +2719,72 @@ paths:
               example: { error: "cannot disable an admin" }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: No user with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { error: "no such user" }
+
+  /api/admin/user/role:
+    post:
+      tags: [admin]
+      operationId: adminUserRole
+      summary: 'Owner: give someone coach access, or take it back'
+      description: |
+        The only route that changes who may run the coaching side, and the only one an ordinary
+        admin cannot call: the caller has to be an **owner** — in `ADMIN_UIDS`, or `owner: true`
+        in `db.json`. A coach whose session is stolen therefore cannot mint more coaches, and
+        the owner cannot be removed by the people they granted access to.
+
+        Owners are never granted here. `admin: true` makes a *secondary* coach: full coaching
+        access (every client's data, plans, subscriptions, device releases, moderation) and
+        nothing of this route. To add an owner, edit `ADMIN_UIDS` or `db.json` and restart.
+
+        Revoking bumps the account's session version, so every session of theirs stops
+        resolving immediately rather than lasting until the cookie expires, and drops their
+        pending device links and live presence. Their next sign-in is an ordinary client's: the
+        subscription gate and the one-device lock, neither of which applies to an admin, both
+        start applying again. Idempotent — setting the flag it already has is a 200 that changes
+        nothing. Audited as `admin.role.grant` / `admin.role.revoke`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, admin]
+              properties:
+                id: { type: string, description: The user id. }
+                admin: { type: boolean, description: '`true` grants coach access, `false` takes it back.' }
+      responses:
+        '200':
+          description: Access updated, or already as asked.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+                  id: { type: string }
+                  admin: { type: boolean }
+        '400':
+          description: The caller's own account, or an owner (whose access is config, not data).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                self: { value: { error: "you cannot change your own access" } }
+                owner: { value: { error: "that account is an owner — change it in ADMIN_UIDS or db.json" } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Not signed in as an admin at all, or an admin who is not the owner.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                notAdmin: { value: { error: "forbidden" } }
+                notOwner: { value: { error: "only the owner can do that" } }
         '404':
           description: No user with that id.
           content:
@@ -2885,6 +3558,27 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example: { error: "forbidden" }
+    SubscriptionRequired:
+      description: >-
+        Signed in, but the subscription is not active — never paid for, or lapsed. Distinct
+        from 403 on purpose: the app shows the payment screen rather than an error. Nothing of
+        the profile is deleted while it is lapsed; renewing restores the same dashboard.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string, const: subscription_required }
+              status: { type: string, enum: [pending, expired] }
+              paidUntil:
+                oneOf: [{ type: integer }, { type: 'null' }]
+                description: Epoch ms the last paid period ran to, if there was one.
+    NoSuchUser:
+      description: No user with that id.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: "no such user" }
     CoachOff:
       description: >-
         The Coach is not set up on this instance — switched off, or no provider connected.
@@ -2992,6 +3686,164 @@ components:
           example: { error: "that code is wrong, used or expired", code: "link-invalid" }
 
   schemas:
+    Goal:
+      type: string
+      enum: [lose_weight, gain_weight, build_muscle, get_stronger, general_fitness]
+      description: What the client is training for.
+    Intake:
+      type: object
+      required: [goal]
+      description: >-
+        What the client told the coach about themselves. Stored on the account rather than in
+        the synced document: it is filled in before there is a subscription to sync, and the
+        coach has to be able to read it from the admin portal.
+      properties:
+        goal: { $ref: '#/components/schemas/Goal' }
+        goalDetail: { type: string, maxLength: 300 }
+        heightCm:
+          oneOf: [{ type: number, minimum: 80, maximum: 260 }, { type: 'null' }]
+        weightKg:
+          oneOf: [{ type: number, minimum: 25, maximum: 400 }, { type: 'null' }]
+        experience: { type: string, enum: [beginner, intermediate, advanced] }
+        daysPerWeek:
+          oneOf: [{ type: number, minimum: 1, maximum: 7 }, { type: 'null' }]
+        injuries: { type: string, maxLength: 1000 }
+        notes: { type: string, maxLength: 1000 }
+        submittedAt: { type: string, format: date-time }
+    Subscription:
+      type: object
+      description: >-
+        Access is sold a month at a time and granted by hand. `paidUntil` is the source of
+        truth: a stored `active` that has run out reads as `expired` without anything having to
+        sweep the database on a timer. An account with no subscription record at all predates
+        subscriptions and reads as active, so upgrading an instance locks nobody out.
+      properties:
+        status: { type: string, enum: [pending, active, expired] }
+        paidUntil:
+          oneOf: [{ type: integer }, { type: 'null' }]
+          description: Epoch ms access runs to.
+        activatedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        note: { type: string, description: The coach's own note, e.g. a payment reference. }
+        legacy:
+          type: boolean
+          description: Present only on an account that predates subscriptions.
+    PlanRequest:
+      type: object
+      description: A client asking the coach for a plan, or for a change to the one they have.
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        kind: { type: string, enum: [new, change] }
+        goal: { $ref: '#/components/schemas/Goal' }
+        message: { type: string, maxLength: 1000 }
+        status: { type: string, enum: [open, in_progress, done] }
+        created: { type: string, format: date-time }
+        updated:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        resolvedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        adminNote: { type: string, maxLength: 1000, description: Shown back to the client. }
+    Plan:
+      type: object
+      description: >-
+        The program the coach assigned one client, stored in `plan-<uid>.json`. Written only by
+        `PUT /api/admin/plan`; `PUT /api/data` drops `routines` and `week` from anything a
+        client pushes, so the client end of the app can read this but never write it.
+      properties:
+        routines:
+          type: array
+          description: Same shape as the routines a profile used to carry in its own document.
+          items: { type: object }
+        week:
+          type: object
+          description: Weekday (0-6) to routine id, or a list of ids for a day with more than one.
+        _rev: { type: integer, description: Server-owned write counter. 0 until first published. }
+        updatedAt:
+          oneOf: [{ type: string, format: date-time }, { type: 'null' }]
+        updatedBy:
+          oneOf: [{ type: string }, { type: 'null' }]
+          description: The admin who last wrote it.
+        note: { type: string, maxLength: 500, description: The coach's note on this plan. }
+    Author:
+      type: object
+      description: >-
+        Who wrote a post or a reply. The display name is resolved when the feed is served and
+        never stored on the post, so renaming a profile renames it everywhere it ever wrote.
+      properties:
+        id: { type: string }
+        name: { type: string }
+        coach:
+          type: boolean
+          description: >-
+            An admin. The app badges these so advice from the coach is never mistaken for
+            another member's opinion.
+        gone:
+          type: boolean
+          description: The account has since been deleted; `name` is empty.
+
+    Post:
+      type: object
+      description: >-
+        One community post with its replies. `canDelete` and `mine` are worked out by the
+        server for the caller asking, rather than re-derived in the app from a second copy of
+        the rules that could drift away from the routes that enforce them.
+      properties:
+        id: { type: string }
+        author: { $ref: '#/components/schemas/Author' }
+        visibility:
+          type: string
+          enum: [public, private]
+          description: >-
+            `public` is the shared feed. `private` is a thread between the author and the
+            coach — invisible to every other member, images included.
+        text: { type: string }
+        images:
+          type: array
+          description: SHA-256 hashes, fetched from `GET /api/community/media/{hash}`.
+          items: { type: string, pattern: '^[0-9a-f]{64}$' }
+        created: { type: string, format: date-time }
+        mine: { type: boolean }
+        canDelete:
+          type: boolean
+          description: The caller wrote it, or the caller is the coach.
+        replies:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              author: { $ref: '#/components/schemas/Author' }
+              text: { type: string }
+              created: { type: string, format: date-time }
+              canDelete: { type: boolean }
+
+    Account:
+      type: object
+      description: >-
+        The coaching state that rides alongside `user` on every sign-in and on `GET /api/me`.
+        Identity and what the account owes are different questions, so they travel in different
+        keys. This one is what the app reads to pick between the gate screens and the dashboard.
+      properties:
+        sub: { $ref: '#/components/schemas/Subscription' }
+        intake:
+          oneOf:
+            - $ref: '#/components/schemas/Intake'
+            - type: 'null'
+        planReady:
+          type: boolean
+          description: Whether the coach has published a plan yet.
+        request:
+          oneOf:
+            - $ref: '#/components/schemas/PlanRequest'
+            - type: 'null'
+        device:
+          oneOf:
+            - type: object
+              properties:
+                label: { type: string, description: e.g. "iOS · Safari". }
+                boundAt: { type: string, format: date-time }
+            - type: 'null'
     Error:
       type: object
       required: [error]
@@ -3460,6 +4312,16 @@ components:
               description: PASSWORD_LOGIN instances only — expiry (ms) of an unused reset code.
         unit: { type: string, enum: [kg, lb] }
         lastSync: { oneOf: [{ type: number }, { type: 'null' }] }
+        adherence:
+          type: object
+          description: >-
+            Sessions logged against sessions prescribed. `d7` and `d28` are percentages
+            capped at 100, and are null when the plan's week has no training days — there
+            is nothing to be adherent to.
+          properties:
+            d7: { oneOf: [{ type: integer }, { type: 'null' }] }
+            d28: { oneOf: [{ type: integer }, { type: 'null' }] }
+            perWeek: { type: integer, description: Training days the plan prescribes per week. }
         routines:
           type: array
           items:

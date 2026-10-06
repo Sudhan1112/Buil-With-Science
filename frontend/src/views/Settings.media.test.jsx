@@ -1,4 +1,4 @@
-// @vitest-environment happy-dom
+﻿// @vitest-environment happy-dom
 import React, { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -11,8 +11,8 @@ import { jpeg } from '../lib/media-samples.test-util.js'
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true
 
-/* Settings → Data with photos and videos: the JSON export says it leaves them out, the zip export
-   carries them, Import takes either, and "Reset everything" takes the files too — on the server
+/* Settings â†’ Data with photos and videos: the JSON export says it leaves them out, the zip export
+   carries them, Import takes either, and "Reset everything" takes the files too â€” on the server
    once the empty state is there, and on this device except what a stash still refers to. */
 const mocks = vi.hoisted(() => {
   const state = { S: null, user: null, config: null, sync: { status: 'ok' }, stashed: new Set() }
@@ -86,7 +86,9 @@ beforeEach(async () => {
   media = createMediaStore(memoryBackend())
   _setMediaStore(media)
   mocks.S = stateWithPhoto()
-  mocks.user = null
+  // Backups, imports and Reset are the coach's rows (views/Settings.jsx, "Data"), so the
+  // default profile here is one. The Photos & videos row itself is everyone's.
+  mocks.user = coach
   mocks.config = null
   mocks.sync = { status: 'ok' }
   mocks.stashed = new Set()
@@ -101,24 +103,37 @@ afterEach(() => {
   host.remove()
   _setMediaStore(null)
 })
+const coach = { id: 'u1', name: 'Ana', admin: true }
 const mount = async () => { act(() => root.render(<Settings />)); await settle() }
 
-describe('Settings — photos and videos', () => {
+describe('Settings â€” photos and videos', () => {
   it('the JSON export says it leaves them out, the zip row and the Photos & videos row appear', async () => {
     await mount()
     expect(row('Export backup (JSON)').textContent).toContain('Without photos and videos')
     expect(row('Export with photos & videos (.zip)')).toBeTruthy()
-    expect(row('Photos & videos').textContent).toContain('Kept on this device only')
+    expect(row('Photos & videos')).toBeTruthy()
     expect(host.querySelector('input[type="file"][accept=".json,.zip,application/json,application/zip"]')).toBeTruthy()
   })
 
+  // Nothing in the block above is a client's â€” not the backups, not the importers, and not the
+  // picker they open, which used to stay mounted for everyone.
+  it('a client gets none of the export or import rows, nor the file pickers', async () => {
+    mocks.user = { id: 'u2', name: 'Bo' }
+    await mount()
+    expect(row('Export backup (JSON)')).toBeUndefined()
+    expect(row('Export with photos & videos (.zip)')).toBeUndefined()
+    expect(row('Import backup')).toBeUndefined()
+    expect(row('Photos & videos')).toBeTruthy()
+    expect(host.querySelector('input[type="file"]')).toBeNull()
+  })
+
   // QA, v1.3.9: a paired phone started in airplane mode has no config yet (it is never cached),
-  // and the row called its photos "Kept on this device only" — the guest's sentence — with no
+  // and the row called its photos "Kept on this device only" â€” the guest's sentence â€” with no
   // count of what was waiting, while they went up by themselves once it was back online.
   it('signed in with the server\'s config not known yet (an offline start): waiting to upload, not kept here only', async () => {
     _resetMediaOwed()
     await media.put(HASH, new Blob([PHOTO]), { mime: 'image/jpeg', pending: true })
-    mocks.user = { id: 'u1', name: 'Ana' }
+    mocks.user = coach
     mocks.config = null
     mocks.sync = { status: 'offline', offline: true }
     await mount()
@@ -127,7 +142,7 @@ describe('Settings — photos and videos', () => {
   })
 
   it('signed in to a server that stores no photos or videos: kept on this device only', async () => {
-    mocks.user = { id: 'u1', name: 'Ana' }
+    mocks.user = coach
     mocks.config = { invite_only: false }
     await mount()
     expect(row('Photos & videos').textContent).toContain('Kept on this device only')
@@ -186,7 +201,7 @@ describe('Settings — photos and videos', () => {
 
   // QA, v1.3.9: the import replaced a workout another device had synced meanwhile, unsaid.
   it('importing over a server that has workouts the backup lacks says how many, and can merge them in', async () => {
-    mocks.user = { id: 'u1', name: 'Ana' }
+    mocks.user = coach
     mocks.conflict = { workouts: 2, state: { workouts: [] }, rev: 9 }
     const S = stateWithPhoto()
     await mount()
@@ -206,7 +221,7 @@ describe('Settings — photos and videos', () => {
   })
 
   it('Reset, signed in: pushes, asks the server to sweep, and keeps only what a stash refers to', async () => {
-    mocks.user = { id: 'u1', name: 'Ana' }
+    mocks.user = coach
     mocks.config = { media: { imageMB: 2 } }
     const other = 'c'.repeat(64)
     await media.put(HASH, new Blob([PHOTO]), { mime: 'image/jpeg', pending: false })
@@ -222,27 +237,20 @@ describe('Settings — photos and videos', () => {
     expect(await media.has(other)).toBe(true)
   })
 
-  it('Reset: no sweep before the empty state is on the server, nor for a guest', async () => {
-    mocks.user = { id: 'u1', name: 'Ana' }
+  // Asked before the push landed, the sweep would see the old state and keep everything — the
+  // safe side, but it means the wipe never finishes. The files still go from this device.
+  it('Reset: no sweep before the empty state is on the server', async () => {
+    mocks.user = coach
     mocks.config = { media: { imageMB: 2 } }
     mocks.sync = { status: 'offline' }
-    await mount()
-    act(() => { row('Reset everything').click() })
-    act(() => { mocks.confirmSheet.mock.calls[0][0].onConfirm() })
-    await until(() => mocks.pushState.mock.calls.length > 0)
-    await settle()
-    expect(mocks.api.mock.calls.map(c => c[0])).not.toContain('/api/media/sweep')
-    act(() => root.unmount())
-    root = createRoot(host)
-    mocks.user = null
-    mocks.sync = { status: 'ok' }
-    mocks.confirmSheet.mockClear(); mocks.api.mockClear()
     await media.put(HASH, new Blob([PHOTO]), { mime: 'image/jpeg', pending: true })
     await mount()
     act(() => { row('Reset everything').click() })
     act(() => { mocks.confirmSheet.mock.calls[0][0].onConfirm() })
+    await until(() => mocks.pushState.mock.calls.length > 0)
     await until(async () => !(await media.has(HASH)))
-    expect(mocks.api).not.toHaveBeenCalled()
+    await settle()
+    expect(mocks.api.mock.calls.map(c => c[0])).not.toContain('/api/media/sweep')
     expect(await media.has(HASH)).toBe(false)
   })
 })

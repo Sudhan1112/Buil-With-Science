@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, forwardRef, useSyncExternalStore } from 'react'
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useStore, DEF, hasData } from '../store/useStore.js'
 import { workoutControls } from '../lib/workout-controls.js'
@@ -22,7 +22,6 @@ import { syncMedia, fetchToStore } from '../lib/media-sync.js'
 import { getMediaStatus, subscribeMediaStatus, pendingRefCount } from '../lib/media-owed.js'
 import { limitsFrom, fmtMB, MB } from '../lib/media-limits.js'
 import { setRestAccent } from '../lib/rest-alert.js'
-import { checkForUpdate, downloadAndInstall } from '../lib/update.js'
 import { forgetCoach } from '../lib/coach-api.js'
 import { starterPlanSheet, confirmSheet, importFromApp, importFromHevy, equipmentProfileSheet, plateInventorySheet, menuSheet } from '../sheets.jsx'
 import Icon from '../components/Icon.jsx'
@@ -35,6 +34,9 @@ export default function Settings() {
   const nav = useNavigate()
   const S = useStore(s => s.S)
   const user = useStore(s => s.user)
+  // Half this screen is the coach's: everything that writes a plan from outside their hands,
+  // and everything that writes a copy of a client's record outside the app.
+  const isAdmin = !!user?.admin
   const coachLocal = useStore(s => s.coachLocal)
   // Name-and-password sign-in, where the instance offers it (#118).
   const config = useStore(s => s.config)
@@ -66,79 +68,6 @@ export default function Settings() {
         { icon: 'pencil', label: t('Keep the numbers, change the label'), onClick: () => setUnit(v, { convert: false }) },
       ],
     })
-  }
-
-  // --- update check state ---
-  const [updateInfo, setUpdateInfo] = useState(null) // { hasUpdate, latestVersion, apkUrl, hashUrl } | null
-  const [android, setAndroid] = useState(false)
-  const [checking, setChecking] = useState(false)
-
-  useEffect(() => {
-    // The in-app updater installs an .apk, so it only applies to the native Android build.
-    // On iOS and the web this check is skipped and the update row never appears. isAndroid()
-    // already answers false off the mobile build; the MOBILE check on top keeps the web bundle
-    // from even asking (and from calling gitlab.com on every Settings visit).
-    if (!MOBILE) return
-    isAndroid().then(ok => { setAndroid(ok); if (ok) checkForUpdate().then(setUpdateInfo).catch(() => {}) })
-  }, [])
-
-  // The same check, on demand: the automatic one is silent when it finds nothing or cannot
-  // reach gitlab.com, and a person who taps "Check for updates" deserves an answer either way.
-  const checkNow = async () => {
-    if (checking) return
-    setChecking(true)
-    try {
-      const info = await checkForUpdate()
-      setUpdateInfo(info)
-      if (!info.hasUpdate) toast(t('You have the latest version.'))
-    } catch {
-      toast(t('Could not check for updates — are you online?'))
-    }
-    setChecking(false)
-  }
-
-  const onUpdateRowClick = () => {
-    if (!updateInfo?.hasUpdate) return
-    if (updateInfo.apkUrl) {
-      // Start download & install
-      const version = updateInfo.latestVersion
-      confirmSheet({
-        title: t('Update to {0}?', version),
-        message: t('The latest version will be downloaded and the installer will open.'),
-        confirmText: t('Download & Install'),
-        onConfirm: async () => {
-          // Open a progress sheet
-          let closeProgress = null
-          let setProgress = null
-          useUI.getState().openSheet(close => {
-            closeProgress = close
-            return <DownloadProgress ref={fn => { setProgress = fn }} />
-          }, { locked: true })
-          try {
-            // The release always publishes the checksum next to the APK. Without it the file is
-            // not installed — a sideloaded binary is exactly the thing that should be verified.
-            let expectedHash = null
-            if (updateInfo.hashUrl) {
-              try {
-                const hashRes = await fetch(updateInfo.hashUrl)
-                if (hashRes.ok) expectedHash = (await hashRes.text()).split(/\s/)[0]
-              } catch (e) { /* reported below */ }
-            }
-            if (!/^[0-9a-f]{64}$/i.test(expectedHash || '')) throw new Error(t('Checksum not available — not installing'))
-            await downloadAndInstall(updateInfo.apkUrl, expectedHash, (received, total) => {
-              if (setProgress) setProgress(received, total)
-            })
-            if (closeProgress) closeProgress()
-          } catch (e) {
-            if (closeProgress) closeProgress()
-            toast(t('Update failed: {0}', e.message))
-          }
-        },
-      })
-    } else {
-      // Update available but no APK asset — open the releases page
-      window.open('https://gitlab.com/DuarteSantos8/opengym/-/releases', '_blank', 'noopener')
-    }
   }
 
   // Reads the store at the moment of the tap: the sheet that asks before a sign-out offers it too,
@@ -248,17 +177,16 @@ export default function Settings() {
     confirmText: t('Sign out everywhere'), danger: true,
     onConfirm: () => leave('everywhere', t('Signed out on all devices')),
   })
-  // Signed in, the empty state is pushed to the profile like any other change, so the wipe
-  // reaches the server and every device that syncs with it — the dialog has to say so. The Coach
-  // keeps its data outside S in two homes that can both be in use on one phone: a file per
-  // profile on the server, and — when it runs with the phone's own key — a file on the device.
-  // Each is cleared on its own; forgetCoach() alone would pick one by mode. A failed call must
-  // not stop the reset.
+  // The empty state is pushed to the profile like any other change, so the wipe reaches the
+  // server and every device that syncs with it — the dialog has to say so. (There is no
+  // local-only wording any more: the row is the coach's, and a coach is by definition an
+  // account on a server.) The Coach keeps its data outside S in two homes that can both be in
+  // use on one phone: a file per profile on the server, and — when it runs with the phone's own
+  // key — a file on the device. Each is cleared on its own; forgetCoach() alone would pick one
+  // by mode. A failed call must not stop the reset.
   const resetEverything = () => confirmSheet({
     title: t('Reset everything?'),
-    message: user
-      ? t('Deletes your plan, workouts, body weight, photos and videos from your profile on this server and on every signed-in device. This cannot be undone.')
-      : t('Deletes your plan, workouts, body weight, photos and videos on this device. This cannot be undone.'),
+    message: t('Deletes your plan, workouts, body weight, photos and videos from your profile on this server and on every signed-in device. This cannot be undone.'),
     confirmText: t('Delete everything'), danger: true,
     onConfirm: () => {
       if (user) api('/api/coach/forget', { method: 'POST', body: '{}' }).catch(() => {})
@@ -384,11 +312,12 @@ export default function Settings() {
           options={[{ value: MONDAY, label: t('Monday') }, { value: SUNDAY, label: t('Sunday') }]}
           value={weekStartOf(S)} onChange={v => update(s => { s.weekStart = v })} />
       </Row>
-      {/* Membership QR codes on Home (views/CheckIn.jsx); off = no Home card, no route. */}
-      <Row icon="qr" iconTint="var(--blue)" title={t('Gym check-in')}
+      {/* Membership QR codes on Home (views/CheckIn.jsx). A feature of running a gym rather
+          than of being coached, so only the coach has the screen — and the switch. */}
+      {isAdmin && <Row icon="qr" iconTint="var(--blue)" title={t('Gym check-in')}
         subtitle={t('Show a card on Home with your membership QR codes.')}>
         <Switch checked={S.checkIn !== false} onChange={v => update(s => { s.checkIn = v })} />
-      </Row>
+      </Row>}
       {/* The Home summary is optional; hiding it leaves weight logging, history and Stats intact. */}
       <Row icon="scale" iconTint="var(--green)" title={t('Body weight')}
         subtitle={t('Show the body weight card on Home.')}>
@@ -541,62 +470,64 @@ export default function Settings() {
       </div>
     </Section>
 
-    {/* ---------- data: fill it, bring things over, back it up, wipe it ---------- */}
+    {/* ---------- data ----------
+        A client's training record is not theirs to take out of the app. Everything that wrote
+        a copy of it somewhere else — the JSON and .zip backups, the auto-backup folder on the
+        phone — is the coach's now, and so is everything that writes the plan from outside the
+        coach's hands: the starter plan and the importers. "Reset everything" goes with them;
+        a client who wants to start over asks, and the coach still has the record of why.
+
+        This is a product rule, not a security boundary. A determined client can read their own
+        data out of the API with their own cookie — nothing can stop that and nothing here
+        pretends to. What it does stop is the one-tap export that turns a coaching relationship
+        into a file somebody forwards. */}
     <Section title={t('Data')}>
-      <Row icon="sparkles" iconTint="var(--acc)" title={t('Load starter plan')} accessory="chevron" onClick={starterPlanSheet} />
-      <Row icon="shuffle" iconTint="var(--teal)" title={t('Import from another app')}
-        subtitle={t('FitNotes, Strong, Hevy — or body weight from Apple Health')}
-        accessory="chevron" onClick={() => importRef.current.click()} />
-      <Row icon="key" iconTint="var(--teal)" title={t('Import from Hevy')}
-        subtitle={t('Pull your history with a Hevy Pro API key')}
-        accessory="chevron" onClick={importFromHevy} />
-      <Row icon="upload" iconTint="var(--blue)" title={t('Import backup')} accessory="chevron" onClick={() => fileRef.current.click()} />
-      <Row icon="download" iconTint="var(--blue)" title={t('Export backup (JSON)')} subtitle={hasMedia ? t('Without photos and videos') : undefined} accessory="chevron" onClick={doExport} />
-      {hasMedia && <Row icon="download" iconTint="var(--blue)" title={t('Export with photos & videos (.zip)')} accessory="chevron" onClick={doExportZip} />}
+      {isAdmin && <>
+        <Row icon="sparkles" iconTint="var(--acc)" title={t('Load starter plan')} accessory="chevron" onClick={starterPlanSheet} />
+        <Row icon="shuffle" iconTint="var(--teal)" title={t('Import from another app')}
+          subtitle={t('FitNotes, Strong, Hevy — or body weight from Apple Health')}
+          accessory="chevron" onClick={() => importRef.current.click()} />
+        <Row icon="key" iconTint="var(--teal)" title={t('Import from Hevy')}
+          subtitle={t('Pull your history with a Hevy Pro API key')}
+          accessory="chevron" onClick={importFromHevy} />
+        <Row icon="upload" iconTint="var(--blue)" title={t('Import backup')} accessory="chevron" onClick={() => fileRef.current.click()} />
+        <Row icon="download" iconTint="var(--blue)" title={t('Export backup (JSON)')} subtitle={hasMedia ? t('Without photos and videos') : undefined} accessory="chevron" onClick={doExport} />
+        {hasMedia && <Row icon="download" iconTint="var(--blue)" title={t('Export with photos & videos (.zip)')} accessory="chevron" onClick={doExportZip} />}
+      </>}
       {hasMedia && <MediaRow />}
-      {/* 14 is AUTO_BACKUP_KEEP in lib/mobile.js, written out because the Settings tests mock
-          that module wholesale; mobile.autobackup.test.js pins the two together. */}
-      {MOBILE && <Row icon="history" iconTint="var(--blue)" title={t('Auto-backup on changes')}
-        subtitle={t('Saves a dated copy to Documents/openGym after finishing a workout or editing a routine, and keeps the newest {0} — point a sync app at that folder, or copy it out by hand.', 14)}>
-        <Switch checked={!!S.autoBackup} onChange={v => update(s => { s.autoBackup = v })} />
-      </Row>}
-      <Row icon="trash" iconTint="var(--red)" title={t('Reset everything')} danger onClick={resetEverything} />
+      {isAdmin && <Row icon="trash" iconTint="var(--red)" title={t('Reset everything')} danger onClick={resetEverything} />}
+      {!isAdmin && <Row icon="cloud" iconTint="var(--blue)" title={t('Your training record')}
+        subtitle={t('Kept on your coach’s server and synced to this device. Ask your coach if you need a copy.')} />}
     </Section>
-    <input ref={fileRef} type="file" accept=".json,.zip,application/json,application/zip" style={{ display: 'none' }} onChange={doImport} />
-    {/* Reset after reading so picking the same file twice still fires onChange. */}
-    <input ref={importRef} type="file" accept=".csv,.xml,text/csv,text/xml" style={{ display: 'none' }}
-      onChange={ev => { const f = ev.target.files[0]; if (f) importFromApp(f); ev.target.value = '' }} />
+    {/* The pickers the rows above open. Behind the same gate as the rows: left mounted for a
+        client they would be an unreachable handle that still writes the plan if something ever
+        reached it. */}
+    {isAdmin && <>
+      <input ref={fileRef} type="file" accept=".json,.zip,application/json,application/zip" style={{ display: 'none' }} onChange={doImport} />
+      {/* Reset after reading so picking the same file twice still fires onChange. */}
+      <input ref={importRef} type="file" accept=".csv,.xml,text/csv,text/xml" style={{ display: 'none' }}
+        onChange={ev => { const f = ev.target.files[0]; if (f) importFromApp(f); ev.target.value = '' }} />
+    </>}
 
-    {/* "Add to Home screen" makes no sense inside the native app */}
-    {!MOBILE && <Section title={t('Tip')}>
-      <Row icon="lightbulb" iconTint="var(--yellow)"
-        title={IS_ANDROID ? t('In Chrome: ⋮ menu → Add to Home screen') : t('In Safari: Share → Add to Home Screen')}
-        subtitle={t('to install openGym as a full-screen app.') + ' ' + (user ? t('Your data syncs with your profile — sign in anywhere to see it.') : t('Guest data stays on this device — export a backup now and then!'))} />
-    </Section>}
-
-    {/* ---------- updates: the last thing on the page, so keeping openGym current is one tap ----------
-        On Android the row is always there — it checks on demand and installs when a release is
-        newer (checksum verified, see onUpdateRowClick). On the web the app updates with its
-        server, so the row points at the APK for the phone instead. iOS has no APK: nothing. */}
-    {(!MOBILE || android) && <Section title={t('Updates')}
-      footer={MOBILE ? t('Releases are checked on gitlab.com. The download is verified against its checksum before the installer opens.') : t('The web app updates together with your server. The Android app installs its own updates from here.')}>
-      {MOBILE
-        ? <Row icon="download" iconTint="var(--acc)"
-            title={updateInfo?.hasUpdate ? t('Update to openGym v{0}', updateInfo.latestVersion) : t('Check for updates')}
-            subtitle={checking ? t('Checking…') : t('You have v{0}', __APP_VERSION__)}
-            accessory="chevron"
-            onClick={() => (updateInfo?.hasUpdate ? onUpdateRowClick() : checkNow())} />
-        : <Row icon="download" iconTint="var(--acc)" title={t('Get the Android app')}
-            subtitle={t('Download the APK from opengym.duarte-santos.ch')} accessory="chevron"
-            onClick={() => window.open('https://opengym.duarte-santos.ch/#download', '_blank', 'noopener')} />}
+    {/* ---------- install ----------
+        There is no app store build and no APK: CareFit is a PWA, so "installing" it is the
+        browser's Add to Home Screen, after which it runs full-screen with its own icon and
+        updates itself whenever the server does. The instruction differs per browser and there
+        is no reliable way to detect which one someone is in beyond the platform, so the iOS
+        wording is the fallback — it is the one that genuinely cannot be automated. */}
+    {!MOBILE && <Section title={t('Install')}
+      footer={t('CareFit updates itself together with your coach’s server — there is nothing to download and nothing to keep current.')}>
+      <Row icon="rocket" iconTint="var(--acc)" title={t('Add CareFit to your home screen')}
+        subtitle={IS_ANDROID ? t('In Chrome: ⋮ menu → Add to Home screen') : t('In Safari: Share → Add to Home Screen')} />
     </Section>}
 
     {/* The version, at the bottom of Settings — which is where the support template has been
-        telling people to look for it, and where it was not. On the phone build there is no
-        address bar and no about box, so without this there is no way to tell which build you
-        are running, or whether an update actually installed. */}
+        telling people to look for it, and where it was not. Installed to the home screen there
+        is no address bar and no about box, so without this there is no way to tell which build
+        you are running. */}
     <div className="dim small" style={{ textAlign: 'center', marginTop: 4, lineHeight: 1.6 }}>
-      openGym v{__APP_VERSION__} · {t('free & open source (AGPL v3)')}<br />
+      CareFit v{__APP_VERSION__}<br />
+      {t('Built on openGym · free & open source (AGPL v3)')}<br />
       <a href="https://github.com/DuarteSantos8/openGym" target="_blank" rel="noopener">source code</a> · exercise data: hasaneyldrm/exercises-dataset (MIT)<br />
       exercise images and animations © <a href="https://gymvisual.com/" target="_blank" rel="noopener">Gym visual</a>
     </div>
@@ -646,32 +577,6 @@ function WorkoutControlsSheet() {
 function workoutControlsSheet() {
   useUI.getState().openSheet(() => <WorkoutControlsSheet />)
 }
-
-// Download progress sheet — receives a ref callback that exposes a (received, total) setter.
-// Uses forwardRef so the caller can push byte counts in without re-rendering the whole Settings tree.
-const DownloadProgress = forwardRef(function DownloadProgress(_, ref) {
-  const [pct, setPct] = useState(0)
-  const [text, setText] = useState(t('Starting download…'))
-  // Expose a setter the caller can invoke directly
-  if (ref) ref(function update(received, total) {
-    if (total > 0) {
-      const p = Math.min(100, Math.round((received / total) * 100))
-      setPct(p)
-      setText(t('{0} %', p))
-    } else {
-      setText(t('{0} MB', (received / 1_000_000).toFixed(1)))
-    }
-  })
-  return (
-    <div style={{ textAlign: 'center', padding: '8px 0' }}>
-      <h3>{t('Downloading update…')}</h3>
-      <div style={{ margin: '16px 0', height: 6, borderRadius: 3, background: 'var(--fill-3)', overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: pct + '%', background: 'var(--acc)', borderRadius: 3, transition: 'width .2s' }} />
-      </div>
-      <div className="muted small">{text}</div>
-    </div>
-  )
-})
 
 function effortHelpSheet() {
   useUI.getState().openSheet(close => <>

@@ -41,11 +41,9 @@ const RP_NAME = process.env.RP_NAME || 'openGym';
 // code the admin generates. Both default off so a fresh self-hosted instance stays open.
 const ADMIN_UIDS = (process.env.ADMIN_UIDS || '').split(',').map(s => s.trim()).filter(Boolean);
 const INVITE_ONLY = /^(1|true|yes|on)$/i.test(process.env.INVITE_ONLY || '');
-// Guest mode ("Continue without account") keeps everything in the browser and never touches this
-// server — but on an instance meant for a known set of people, an entrance nobody can walk back
-// out of is still the wrong front door (#42). Default ON, so existing instances are unchanged;
-// the polarity is inverted from INVITE_ONLY because the safe default here is the permissive one.
-const ALLOW_GUEST = !/^(0|false|no|off)$/i.test(process.env.ALLOW_GUEST || '');
+// Guest mode is gone. Access is sold a month at a time and bound to one device, so a front door
+// that hands out an anonymous local-only profile is not a door this instance has. ALLOW_GUEST is
+// still read and reported so an old client gets a straight "no" rather than a missing field.
 // Name-and-password sign-in next to passkeys (#118). Off by default: it adds a second way into
 // every account that opts in, so an instance has to ask for it. While it is off every password
 // route answers 404 and the app shows none of it; hashes already stored stay where they are.
@@ -100,7 +98,131 @@ try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
 db.subs = db.subs || [];
 db.invites = db.invites || [];
 db.deviceLinks = db.deviceLinks || [];   // unused one-time device links, hashed (device-link.js)
-const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
+db.planRequests = db.planRequests || []; // clients asking the coach for a plan or a change
+db.posts = db.posts || [];               // community hub
+/* Two levels, because "coach" and "the person who owns this instance" are not the same job.
+ *
+ *   owner      ADMIN_UIDS, or `owner: true` in db.json. Everything an admin can do, plus the one
+ *              thing no HTTP route used to do at all: hand coach access to somebody else.
+ *   admin      an owner, or `admin: true`. The coaching job — every client's data, their plans,
+ *              their subscriptions, moderation. Cannot grant or revoke admin, cannot touch an
+ *              owner.
+ *
+ * Keeping promotion in the owner's hands rather than every admin's is what stops a stolen coach
+ * session from minting more coaches, and what keeps the owner un-removable by someone they
+ * hired. An owner is still only ever granted the way it always was — by whoever can edit the
+ * config or the database, never over the network — so the route below can widen the circle of
+ * admins and never the circle of owners. */
+const isOwner = user => !!user && (user.owner === true || ADMIN_UIDS.includes(user.id));
+const isAdmin = user => !!user && (user.admin === true || isOwner(user));
+
+/* ---------- subscriptions ----------
+ * Access is sold a month at a time and granted by hand: the client pays against the QR on the
+ * gate screen, the coach confirms it in the admin portal, and that sets `paidUntil`. There is no
+ * payment provider in the loop, so there is nothing here to reconcile with one.
+ *
+ * Lapsing locks the door, it never deletes: `state-<uid>.json` and `plan-<uid>.json` are left
+ * exactly as they were, so a renewal puts the client back into the dashboard they left.
+ */
+const SUB_STATUSES = new Set(['pending', 'active', 'expired']);
+// Admins are staff, not customers — they are never gated.
+function subOf(user) {
+  // No subscription record at all means the account predates subscriptions: upgrading a running
+  // instance must not lock out everyone already training on it. Signup stamps 'pending'
+  // explicitly (see newSub below), so this only ever covers accounts that existed before.
+  if (!record(user?.sub)) return { status: 'active', paidUntil: null, activatedAt: null, note: '', legacy: true };
+  const s = user.sub;
+  const paidUntil = Number(s.paidUntil) || 0;
+  const status = SUB_STATUSES.has(s.status) ? s.status : 'pending';
+  // `paidUntil` is the source of truth; a stored 'active' that has run out reads as expired
+  // without anything having to sweep the database on a timer.
+  const effective = status === 'active' && paidUntil && paidUntil < Date.now() ? 'expired' : status;
+  return { status: effective, paidUntil: paidUntil || null, activatedAt: s.activatedAt || null, note: typeof s.note === 'string' ? s.note : '' };
+}
+const subActive = user => isAdmin(user) || subOf(user).status === 'active';
+// Every account created from now on starts owing: the client pays, the coach confirms, and only
+// then does /api/data answer for them.
+const newSub = () => ({ status: 'pending', paidUntil: 0, activatedAt: null, note: '' });
+
+/* ---------- intake + plan requests ----------
+ * What the coach needs before they can write a program, and the client's standing ask. Both sit
+ * on the account rather than in the synced document: the client fills them in before there is a
+ * subscription to sync, and the coach has to be able to read them from the admin portal.
+ */
+const GOALS = new Set(['lose_weight', 'gain_weight', 'build_muscle', 'get_stronger', 'general_fitness']);
+const EXPERIENCE = new Set(['beginner', 'intermediate', 'advanced']);
+const num = (v, lo, hi) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= lo && n <= hi ? Math.round(n * 10) / 10 : null;
+};
+// Returns null when there is no usable goal — everything else is optional and simply absent.
+function readIntake(body) {
+  if (!record(body) || !GOALS.has(body.goal)) return null;
+  return {
+    goal: body.goal,
+    goalDetail: text(body.goalDetail).trim().slice(0, 300),
+    heightCm: num(body.heightCm, 80, 260),
+    weightKg: num(body.weightKg, 25, 400),
+    experience: EXPERIENCE.has(body.experience) ? body.experience : 'beginner',
+    daysPerWeek: num(body.daysPerWeek, 1, 7),
+    injuries: text(body.injuries).trim().slice(0, 1000),
+    notes: text(body.notes).trim().slice(0, 1000)
+  };
+}
+const myRequest = uid => db.planRequests.find(r => r.userId === uid && r.status !== 'done') || null;
+
+/* ---------- community hub ----------
+ * The whole visibility rule, in one function that every community route calls. A public post is
+ * the shared feed; a private one is a thread between its author and the coach and nobody else.
+ * Keeping it here rather than inline in four routes is the point: there is exactly one place to
+ * read to know who can see what, and exactly one place a mistake could be. */
+const canSee = (user, post) =>
+  !!post && (post.visibility === 'public' || post.userId === user.id || isAdmin(user));
+
+// Attached photos, by the same sha256 the media store is keyed on. A bad entry is dropped
+// rather than refused — a client with one damaged hash should still get its post published.
+const readHashes = v =>
+  (Array.isArray(v) ? v : []).filter(h => typeof h === 'string' && HASH_RE.test(h)).slice(0, 4);
+
+// What a post looks like on the wire. Display names are resolved here and not stored on the
+// post, so a renamed profile is renamed everywhere it ever wrote; an author whose account is
+// gone reads as a former member rather than as a dangling id.
+const nameOf = uid => db.users.find(u => u.id === uid)?.name || '';
+const authorOf = uid => {
+  const u = db.users.find(x => x.id === uid);
+  return { id: uid, name: u?.name || '', coach: isAdmin(u), gone: !u };
+};
+const publicPost = (p, viewer) => ({
+  id: p.id,
+  author: authorOf(p.userId),
+  visibility: p.visibility,
+  text: p.text,
+  images: p.images || [],
+  created: p.created,
+  // What this viewer may do with it, worked out here rather than re-derived in the UI from a
+  // copy of the rules that could drift out of step with the routes that enforce them.
+  mine: p.userId === viewer.id,
+  canDelete: p.userId === viewer.id || isAdmin(viewer),
+  replies: (p.replies || []).map(r => ({
+    id: r.id, author: authorOf(r.userId), text: r.text, created: r.created,
+    canDelete: r.userId === viewer.id || isAdmin(viewer)
+  }))
+});
+
+/* Sessions done against sessions prescribed, over the last 7 and 28 days. The denominator is how
+ * many days of the assigned week carry a routine — an empty plan has nothing to adhere to, so it
+ * reports null rather than a demoralising 0%. */
+function adherenceOf(workouts, plan) {
+  const perWeek = Object.values(plan.week || {}).filter(v => (Array.isArray(v) ? v.length : !!v)).length;
+  if (!perWeek) return { d7: null, d28: null, perWeek: 0 };
+  const dayMs = 86400000;
+  const since = d => {
+    const cut = new Date(Date.now() - d * dayMs).toISOString().slice(0, 10);
+    return workouts.filter(w => typeof w.d === 'string' && w.d >= cut).length;
+  };
+  const pct = (done, days) => Math.min(100, Math.round((done / (perWeek * days / 7)) * 100));
+  return { d7: pct(since(7), 7), d28: pct(since(28), 28), perWeek };
+}
 // 0600: db.json holds passkey credential material. It used to be covered by a blanket 0700 on
 // the whole directory; now that the directory stays traversable, the file carries its own mode.
 function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2), 0o600); }
@@ -135,6 +257,72 @@ function readState(uid) {
 // there is the honest reading of such a file — what was dropped carried nothing to show.
 const record = x => !!x && typeof x === 'object' && !Array.isArray(x);
 const records = v => (Array.isArray(v) ? v.filter(record) : []);
+
+/* ---------- assigned plans (coach-owned) ----------
+ * The weekly program is the coach's work, not the client's. It lives in its own file, is written
+ * only by the admin routes, and PUT /api/data drops both keys on the way in — which is what makes
+ * "only the coach writes plans" an API rule rather than a hidden button. A client that forges the
+ * push still cannot assign itself a routine.
+ *
+ * `dayPlan` deliberately stays in the client's own document: that one is "I'm doing Monday's
+ * session on Tuesday", which is rescheduling, not programming.
+ */
+const planFile = uid => path.join(DATA, 'plan-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
+const PLAN_KEYS = ['routines', 'week'];
+const emptyPlan = () => ({ routines: [], week: {}, _rev: 0, updatedAt: null, updatedBy: null, note: '' });
+function readPlan(uid) {
+  try { return JSON.parse(fs.readFileSync(planFile(uid), 'utf8')); } catch { return null; }
+}
+// Same shape every reader can rely on, whatever is (or isn't) on disk.
+function planOf(uid) {
+  const p = readPlan(uid);
+  if (!record(p)) return emptyPlan();
+  return {
+    routines: records(p.routines),
+    week: record(p.week) ? p.week : {},
+    _rev: Number(p._rev) || 0,
+    updatedAt: p.updatedAt || null,
+    updatedBy: p.updatedBy || null,
+    note: typeof p.note === 'string' ? p.note : ''
+  };
+}
+function writePlan(uid, next) {
+  atomicWrite(planFile(uid), JSON.stringify(next));
+  return next;
+}
+// Has the coach published anything yet? Drives the client's "your plan is being prepared" gate.
+const planPublished = p => p._rev > 0 && (p.routines.length > 0 || Object.keys(p.week).length > 0);
+
+/* One-time lift of the program out of each profile's synced document. A profile that already has
+ * a plan file is skipped, so restarting the server is free. The keys are removed from the state
+ * file in the same pass: two copies of the program with only one writable is the kind of thing
+ * that reads fine and then drifts. */
+function migratePlans() {
+  for (const user of db.users) {
+    if (fs.existsSync(planFile(user.id))) continue;
+    let S;
+    try { S = readState(user.id); } catch { continue; }
+    if (!record(S)) continue;
+    const routines = records(S.routines);
+    const week = record(S.week) ? S.week : {};
+    const hadKeys = PLAN_KEYS.some(k => S[k] !== undefined);
+    if (!hadKeys) continue;
+    try {
+      writePlan(user.id, {
+        routines, week,
+        _rev: routines.length || Object.keys(week).length ? 1 : 0,
+        updatedAt: new Date().toISOString(), updatedBy: null,
+        note: 'lifted from the profile document on upgrade'
+      });
+      for (const k of PLAN_KEYS) delete S[k];
+      S._rev = (Number(S._rev) || 0) + 1;
+      atomicWrite(stateFile(user.id), JSON.stringify(S));
+    } catch (e) {
+      console.error('plan migration failed for', user.id, e.message);
+    }
+  }
+}
+migratePlans();
 
 /* ---------- push notifications (Web Push / VAPID) ---------- */
 const vapidFile = path.join(DATA, 'vapid.json');
@@ -441,9 +629,55 @@ function verifySig(token) {
 // signing out the whole instance. Cookies minted before `sv` existed have no third field and are
 // read as version 0, matching a user who has never bumped — they stay valid until they expire.
 const sessionVersion = user => user.sv || 0;
-function makeSession(user) {
+/* ---------- one device per account ----------
+ * A subscription is sold to a person, and a password shared round a gym is the ordinary way that
+ * stops being true. So a client account binds to the first device that signs in, and a second
+ * device is refused outright rather than quietly taking over — the point is that the sharer hits
+ * a wall, not that the two of them trade the account back and forth.
+ *
+ * The device id is a fourth field in the session payload, so releasing a lock (which clears
+ * `user.device`) also kills every cookie minted for the old device, without a session table.
+ * Admins are never bound: the coach works from a phone and a desktop.
+ *
+ * Tokens minted before this existed have no fourth field and are read as unbound. They keep
+ * working for accounts that have not been bound yet, which is every account at upgrade time —
+ * nobody is signed out by deploying this. The first sign-in after that binds the account, and
+ * from then on an unbound token no longer satisfies a bound account.
+ */
+const DEVICE_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+const cleanDeviceId = v => (DEVICE_ID_RE.test(String(v || '').trim()) ? String(v).trim() : '');
+function makeSession(user, deviceId = '') {
   const exp = Date.now() + SESSION_DAYS * 86400000;
-  return sign(user.id + ':' + exp + ':' + sessionVersion(user));
+  const did = cleanDeviceId(deviceId);
+  // No fourth field at all when there is nothing to bind, so an unbound token stays byte-for-byte
+  // what it was before devices existed.
+  return sign(user.id + ':' + exp + ':' + sessionVersion(user) + (did ? ':' + did : ''));
+}
+// Decide whether `deviceId` may open a session for this account, binding it if the account is
+// free. Returns the id to write into the token, or an { error } the caller turns into a 409.
+function claimDevice(user, rawId, req) {
+  if (isAdmin(user)) return { deviceId: '' };
+  const deviceId = cleanDeviceId(rawId);
+  const bound = record(user.device) ? user.device : null;
+  if (bound?.id) {
+    if (bound.id === deviceId) return { deviceId };
+    audit(req, 'auth.device.blocked', { ok: false, user });
+    return { error: { error: 'device_locked', boundLabel: bound.label || '', boundAt: bound.boundAt || null } };
+  }
+  // A client that sent no usable id (storage wiped mid-session, a script) is let in but not
+  // bound: binding a blank would lock the account to every such caller at once.
+  if (!deviceId) return { deviceId: '' };
+  user.device = { id: deviceId, label: deviceLabel(req), boundAt: new Date().toISOString() };
+  try { saveDb(); } catch (e) { console.error('db save failed', e.message); }
+  audit(req, 'auth.device.bound', { user });
+  return { deviceId };
+}
+// Enough to tell "my old phone" from "my new one" in the admin list, and nothing more.
+function deviceLabel(req) {
+  const ua = String(req.headers['user-agent'] || '');
+  const os = /iPhone|iPad|iPod/i.test(ua) ? 'iOS' : /Android/i.test(ua) ? 'Android' : /Mac OS X/i.test(ua) ? 'Mac' : /Windows/i.test(ua) ? 'Windows' : /Linux/i.test(ua) ? 'Linux' : 'Unknown';
+  const br = /CriOS|Chrome/i.test(ua) ? 'Chrome' : /FxiOS|Firefox/i.test(ua) ? 'Firefox' : /Edg/i.test(ua) ? 'Edge' : /Safari/i.test(ua) ? 'Safari' : '';
+  return br ? `${os} · ${br}` : os;
 }
 // With the __Host- prefix the *browser* guarantees the cookie is host-only (no Domain attribute
 // is even allowed) — which is what stops a sibling subdomain, e.g. anything-else.example.com
@@ -489,7 +723,7 @@ function sessionOf(req) {
   if (!tok) return null;
   const payload = verifySig(tok);
   if (!payload) return null;
-  const [uid, exp, ver] = payload.split(':');
+  const [uid, exp, ver, did] = payload.split(':');
   if (!uid || +exp < Date.now()) return null;
   const user = db.users.find(u => u.id === uid) || null;
   if (!user) return null;
@@ -498,7 +732,11 @@ function sessionOf(req) {
   // payload (it still had to pass the HMAC, so this is belt-and-braces) and is refused outright.
   const claimed = ver === undefined ? 0 : Number(ver);
   if (!Number.isInteger(claimed) || claimed !== sessionVersion(user)) return null;
-  return { user, exp: +exp, bearer: !cookie };
+  // A bound account only answers to the device it is bound to. Releasing the lock clears
+  // `user.device`, which drops every token that named the old one.
+  const bound = record(user.device) ? user.device.id : '';
+  if (bound && !isAdmin(user) && (did || '') !== bound) return null;
+  return { user, exp: +exp, bearer: !cookie, deviceId: did || '' };
 }
 function readSession(req) {
   return sessionOf(req)?.user || null;
@@ -512,9 +750,32 @@ function requireAdmin(req, res) {
   if (!isAdmin(user)) { audit(req, 'admin.denied', { ok: false, user }); json(res, 403, { error: 'forbidden' }); return null; }
   return user;
 }
+// Guard for the handful of routes an admin is not enough for — granting and revoking coach
+// access. Recorded even when the caller is a perfectly ordinary admin: a coach reaching for
+// this is worth seeing in the log whether or not they meant anything by it.
+function requireOwner(req, res) {
+  const user = requireAdmin(req, res);
+  if (!user) return null;
+  if (!isOwner(user)) { audit(req, 'admin.denied', { ok: false, user, msg: 'owner only' }); json(res, 403, { error: 'only the owner can do that' }); return null; }
+  return user;
+}
+/* Guard for everything a paying client touches. 402 rather than 403 so the app can tell "your
+ * subscription lapsed, here is the QR" apart from "you may not do that at all" — the two want
+ * very different screens. /api/me and /api/config stay open to an unpaid session, because the
+ * gate screen has to be able to ask who it is talking to and what it owes. */
+function requireActiveSub(req, res) {
+  const user = readSession(req);
+  if (!user) { json(res, 401, { error: 'not signed in' }); return null; }
+  if (!subActive(user)) {
+    const sub = subOf(user);
+    json(res, 402, { error: 'subscription_required', status: sub.status, paidUntil: sub.paidUntil });
+    return null;
+  }
+  return user;
+}
 const expireCookie = name => `${name}=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
-function sessionCookie(user) {
-  const fresh = `${COOKIE}=${makeSession(user)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
+function sessionCookie(user, deviceId = '') {
+  const fresh = `${COOKIE}=${makeSession(user, deviceId)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
   // Signing in also retires any pre-upgrade cookie, so nobody is left carrying an unprefixed one
   // (or a shadowing copy of it) alongside the new session.
   return COOKIE === LEGACY_COOKIE ? [fresh] : [fresh, expireCookie(LEGACY_COOKIE)];
@@ -522,6 +783,14 @@ function sessionCookie(user) {
 const clearCookie = COOKIE === LEGACY_COOKIE
   ? [expireCookie(LEGACY_COOKIE)]
   : [expireCookie(COOKIE), expireCookie(LEGACY_COOKIE)];
+/* Every browser sign-in path ends here: claim the device for the account, then hand back the
+ * cookie. A refused claim is a 409 and no session at all — the app turns that into the "already
+ * in use on another device" dialog. */
+function grantSession(req, res, user, body, extra) {
+  const claim = claimDevice(user, body?.deviceId, req);
+  if (claim.error) return json(res, 409, claim.error);
+  json(res, 200, { user: publicUser(user), account: accountState(user), ...(extra || {}) }, { 'Set-Cookie': sessionCookie(user, claim.deviceId) });
+}
 
 /* ---------- CSRF ---------- */
 // SameSite=Lax keeps the session cookie off a genuinely cross-*site* request. It does not keep it
@@ -951,7 +1220,19 @@ function loginTarget(body) {
 }
 const acctKey = u => 'acct:' + u.id;
 const passkeyCount = u => db.creds.filter(c => c.userId === u.id).length;
-const publicUser = u => ({ id: u.id, name: u.name, admin: isAdmin(u) });
+// `owner` rides along with `admin` because the app has to tell the two apart: only an owner is
+// offered the control that grants coach access to somebody else.
+const publicUser = u => ({ id: u.id, name: u.name, admin: isAdmin(u), owner: isOwner(u) });
+// Who you are and what you owe are different questions, so they travel in different keys:
+// `user` is identity and never changes shape, `account` is the coaching state the app reads to
+// pick between the gate screens and the dashboard.
+const accountState = u => ({
+  sub: subOf(u),
+  intake: record(u.intake) ? u.intake : null,
+  planReady: planPublished(planOf(u.id)),
+  request: myRequest(u.id),
+  device: record(u.device) ? { label: u.device.label || '', boundAt: u.device.boundAt || null } : null
+});
 const POLICY_ERRORS = {
   'too-short': `the password needs at least ${MIN_LENGTH} characters`,
   'too-long': `the password can have at most ${MAX_LENGTH} characters`,
@@ -1132,7 +1413,7 @@ const passwordRoutes = {
       if (!still()) return json(res, 401, WRONG);
     }
     audit(req, 'auth.password.ok', { user });
-    json(res, 200, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(user) });
+    grantSession(req, res, user, body);
   },
 
   // For browsers that cannot make a passkey at all: plain http on a LAN address, some Firefox
@@ -1179,12 +1460,12 @@ const passwordRoutes = {
     // No await from here to the push: nothing can take the address between this check and it.
     if (email && emailTaken(email)) return emailRefused();
     const created = new Date().toISOString();
-    const user = { id: crypto.randomBytes(12).toString('base64url'), name, created, pw: { h, set: created }, ...(email ? { email } : {}) };
+    const user = { id: crypto.randomBytes(12).toString('base64url'), name, created, sub: newSub(), pw: { h, set: created }, ...(email ? { email } : {}) };
     if (inv) { user.invitedBy = inv.code; inv.usedBy = user.id; inv.usedAt = created; }
     db.users.push(user);
     saveDb();
     audit(req, 'auth.register.ok', { user, msg: inv ? inv.code + ' · password' : 'password' });
-    json(res, 200, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(user) });
+    grantSession(req, res, user, body);
   },
 
   // What Settings shows: whether a password is set, and whether it could be removed.
@@ -1359,7 +1640,7 @@ const passwordRoutes = {
     ACCOUNT_FAILS.clear(acctKey(user));
     saveDb();
     audit(req, 'auth.password.reset', { user });
-    json(res, 200, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(user) });
+    grantSession(req, res, user, body);
   }
 };
 
@@ -1603,7 +1884,7 @@ const passkeyRoutes = {
     burnDeviceLink(db, link);
     saveDb();
     audit(req, 'auth.link.ok', { user, msg: added.row.name || null });
-    json(res, 200, { user: publicUser(user) }, { 'Set-Cookie': sessionCookie(user) });
+    grantSession(req, res, user, body);
   }
 };
 
@@ -1614,7 +1895,15 @@ const passkeyRoutes = {
 // either way: an admin deleting a profile must still remove files uploaded while it was on.
 const MEDIA_LIMITS = mediaLimits(process.env);
 const MEDIA_ON = MEDIA_LIMITS.enabled;
-const MEDIA = createMediaStore({ dir: path.join(DATA, 'uploads'), limits: MEDIA_LIMITS, readState });
+// `extraRefs`: photos attached to community posts live in db.json, not in the profile's synced
+// document, so without this the sweeper would see them as unreferenced and delete the picture
+// out from under a post that still shows it.
+const MEDIA = createMediaStore({
+  dir: path.join(DATA, 'uploads'),
+  limits: MEDIA_LIMITS,
+  readState,
+  extraRefs: uid => db.posts.filter(p => p.userId === uid).flatMap(p => p.images || [])
+});
 // Leftovers of uploads the previous process was receiving when it stopped.
 try { MEDIA.cleanTmp(); } catch (e) { console.error('media: boot cleanup failed', e.message); }
 // Per profile, not per address: every upload is signed in, and behind a proxy one address can be
@@ -1682,21 +1971,25 @@ async function sendMediaFile(res, f, hash) {
   catch { res.destroy(); }   // the client went away mid-download; nothing left to answer
 }
 
+/* Photos and videos are training data like any other, so these four sit behind the same
+   subscription gate as GET /api/data rather than behind a bare session: a lapsed account that
+   still holds a cookie and a list of hashes should not be able to pull its library down one
+   file at a time. Admins pass through, as everywhere (subActive). */
 const mediaRoutes = {
   // The raw bytes of one file, named by the sha256 the client computed. media.js checks the
   // hash, the magic bytes, the caps, the quota and the free disk; this route only adds the
   // session and the hourly budget.
   'PUT /api/media/{hash}': async (req, res) => {
-    const user = readSession(req);
-    if (!user) { MEDIA.discard(req); return json(res, 401, { error: 'not signed in' }); }
+    const user = requireActiveSub(req, res);
+    if (!user) { MEDIA.discard(req); return; }
     try { mediaThrottle(req, user, MEDIA_BURST); } catch (e) { MEDIA.discard(req); throw e; }
     req.allowSlowBody?.();   // a signed-in upload within its budget may take the half hour
     const r = await MEDIA.receive(user.id, req.mediaHash, req);
     json(res, r.status, r.body);
   },
   'GET /api/media/{hash}': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
     // Only ever the caller's own folder: another profile's file is exactly as missing as one
     // that was never uploaded.
     const f = MEDIA.file(user.id, req.mediaHash);
@@ -1706,8 +1999,8 @@ const mediaRoutes = {
   // Which of these the server does not have, so a device uploads only those. Answered from the
   // in-memory list of the caller's own folder.
   'POST /api/media/missing': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
     const body = await readBody(req);
     const hashes = body.hashes;
     if (!Array.isArray(hashes) || hashes.length > 1000 || !hashes.every(h => typeof h === 'string' && HASH_RE.test(h))) {
@@ -1718,8 +2011,8 @@ const mediaRoutes = {
   // "Reset everything": every file the caller's current state does not reference goes now,
   // without the grace. A state that cannot be read removes nothing.
   'POST /api/media/sweep': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
     await readBody(req);
     mediaThrottle(req, user, MEDIA_SWEEPS);
     const r = MEDIA.sweep(user.id, { graceMs: 0 });
@@ -1752,7 +2045,7 @@ const routes = {
     // were not signed in when you asked", and would re-ask on every sign-in on every instance
     // that has no Coach. The key's absence is that answer.
     json(res, 200, {
-      invite_only: INVITE_ONLY, allow_guest: ALLOW_GUEST,
+      invite_only: INVITE_ONLY, allow_guest: false,
       // Only when on, so an instance without passwords answers exactly as it did before (#118).
       ...(PASSWORD_LOGIN ? { password_login: true } : {}),
       // Public: the sign-in screen is the first thing that reads it.
@@ -1776,7 +2069,9 @@ const routes = {
     if (!s) return json(res, 401, { error: 'not signed in' });
     const { user } = s;
     const renew = s.bearer && s.exp - Date.now() < SESSION_DAYS * 86400000 / 2;
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) }, ...(renew ? { token: makeSession(user) } : {}) });
+    // Answers for an unpaid session too: the gate screen has to know who it is talking to and
+    // what the account owes before it can render anything.
+    json(res, 200, { user: publicUser(user), account: accountState(user), ...(renew ? { token: makeSession(user, s.deviceId) } : {}) });
   },
 
   'POST /api/register/options': async (req, res) => {
@@ -1840,7 +2135,7 @@ const routes = {
         return json(res, 403, { error: 'invite code is no longer valid — ask for a new one' });
       }
     }
-    const user = { id: c.uid, name: c.name, created: new Date().toISOString() };
+    const user = { id: c.uid, name: c.name, created: new Date().toISOString(), sub: newSub() };
     if (invite) { user.invitedBy = invite.code; invite.usedBy = user.id; invite.usedAt = user.created; }
     db.users.push(user);
     db.creds.push({
@@ -1853,7 +2148,7 @@ const routes = {
     });
     saveDb();
     audit(req, 'auth.register.ok', { user, msg: invite ? invite.code : null });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    grantSession(req, res, user, body);
   },
 
   'POST /api/login/options': async (req, res) => {
@@ -1915,7 +2210,7 @@ const routes = {
       return json(res, 403, { error: 'this account has been disabled' });
     }
     audit(req, 'auth.login.ok', { user });
-    json(res, 200, { user: { id: user.id, name: user.name, admin: isAdmin(user) } }, { 'Set-Cookie': sessionCookie(user) });
+    grantSession(req, res, user, body);
   },
 
   // Reads the session purely so the sign-out can be recorded; the cookie is cleared either way.
@@ -1971,7 +2266,9 @@ const routes = {
       return json(res, 400, { error: 'invalid or expired code' });
     }
     audit(req, 'auth.pair.ok', { user });
-    json(res, 200, { token: makeSession(user), user: { id: user.id, name: user.name, admin: isAdmin(user) } });
+    const claim = claimDevice(user, body.deviceId, req);
+    if (claim.error) return json(res, 409, claim.error);
+    json(res, 200, { token: makeSession(user, claim.deviceId), user: publicUser(user), account: accountState(user) });
   },
 
   // Absent entirely while PASSWORD_LOGIN is off, so each of them is a plain 404.
@@ -1984,11 +2281,80 @@ const routes = {
   // `_rev`, so every other reader of the file — reminder tick, admin, Coach, MCP — is unaffected).
   // A client pushes it back as `baseRev`, and a write over a document it never saw is refused.
   'GET /api/data': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
     const state = readState(user.id);
     notePull(user);
-    json(res, 200, { state, rev: state?._rev || 0 });
+    // The coach's program rides along. The client has to put it back onto every copy it takes
+    // from here — this route strips nothing, but PUT /api/data does, so what is stored under
+    // `state` has no program in it — and sending it here means a pull stays one request.
+    const plan = planOf(user.id);
+    json(res, 200, { state, rev: state?._rev || 0, plan, planPublished: planPublished(plan) });
+  },
+
+  /* What the client tells the coach about themselves, and what they are asking for. Both are
+   * open to an unpaid session on purpose: the intake form is the thing they fill in *while* the
+   * payment is being confirmed, so gating it behind an active subscription would mean the coach
+   * receives a paid account with nothing to write a plan from. */
+  'POST /api/intake': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    const body = await readBody(req);
+    const intake = readIntake(body);
+    if (!intake) return json(res, 400, { error: 'a goal is required' });
+    user.intake = { ...intake, submittedAt: new Date().toISOString() };
+    saveDb();
+    audit(req, 'client.intake', { user, msg: intake.goal });
+    json(res, 200, { ok: true, intake: user.intake });
+  },
+
+  'POST /api/plan-request': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    const body = await readBody(req);
+    const kind = body.kind === 'change' ? 'change' : 'new';
+    const goal = GOALS.has(body.goal) ? body.goal : (record(user.intake) ? user.intake.goal : '');
+    if (!goal) return json(res, 400, { error: 'a goal is required' });
+    // One open request per client. A second tap is an edit of the one already on the coach's
+    // desk, not a duplicate card for them to work out the ordering of.
+    const open = db.planRequests.find(r => r.userId === user.id && r.status !== 'done');
+    const message = text(body.message).trim().slice(0, 1000);
+    if (open) {
+      Object.assign(open, { kind, goal, message, updated: new Date().toISOString() });
+    } else {
+      db.planRequests.push({
+        id: crypto.randomBytes(9).toString('base64url'),
+        userId: user.id, kind, goal, message,
+        status: 'open', created: new Date().toISOString(),
+        updated: null, resolvedAt: null, adminNote: ''
+      });
+    }
+    saveDb();
+    audit(req, 'client.request', { user, msg: kind + ' · ' + goal });
+    json(res, 200, { ok: true, request: myRequest(user.id) });
+  },
+
+  // The client's own request, so Home can show "your coach is on it".
+  'GET /api/plan-request': async (req, res) => {
+    const user = readSession(req);
+    if (!user) return json(res, 401, { error: 'not signed in' });
+    json(res, 200, { request: myRequest(user.id) });
+  },
+
+  // The coach's program for this client, read-only. Served separately from the synced document
+  // so that the one route a client can write cannot reach it (see PUT /api/data below).
+  'GET /api/plan': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    const plan = planOf(user.id);
+    json(res, 200, { plan, rev: plan._rev, published: planPublished(plan) });
+  },
+  // Polled next to /api/data/rev so a client picks up a newly published plan without refetching
+  // the whole thing.
+  'GET /api/plan/rev': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    json(res, 200, { rev: planOf(user.id)._rev });
   },
   // Just the revision: the client asks this every half minute while it is open and on every
   // return to the foreground, and fetches the document only when the number moved — a signed-in
@@ -1997,14 +2363,120 @@ const routes = {
   // to read one number off it cost 31 ms per poll on a 2.4 MB state, all of it on the event loop.
   // Every write goes through atomicWrite's rename, so the cache can never hand out a stale rev.
   'GET /api/data/rev': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
-    json(res, 200, { rev: readStateCached(user.id)?._rev || 0 });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    // `planRev` for the same reason, and at the same price: a plan the coach published a minute
+    // ago has to reach the client's next poll, and a second round trip for a number that moves
+    // a few times a month is not worth making every thirty seconds.
+    json(res, 200, { rev: readStateCached(user.id)?._rev || 0, planRev: planOf(user.id)._rev });
+  },
+
+  /* ---------- community hub ----------
+   * One shared feed for everyone on the instance, plus each client's own private thread with
+   * their coach. The two are the same object with a different `visibility`, which is what makes
+   * the rule simple enough to be obviously right: `canSee` is the only place that decides, and
+   * every route goes through it.
+   *
+   *   public   everyone with an active subscription sees it, and may reply
+   *   private  the author and the coach, nobody else — not in the feed, not by id, and not
+   *            the images attached to it (GET /api/community/media/{hash})
+   *
+   * Private is the default for nothing: a client picks per post. The coach replies in both, and
+   * their replies carry a badge so advice is never mistaken for another member's opinion. */
+  'GET /api/community': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    // `scope` narrows the feed without changing who may see what: it filters the same list
+    // `canSee` already allowed, so asking for 'public' can never widen it.
+    const scope = req.url.includes('scope=mine') ? 'mine' : req.url.includes('scope=private') ? 'private' : 'all';
+    const rows = db.posts
+      .filter(p => canSee(user, p))
+      .filter(p => (scope === 'mine' ? p.userId === user.id : scope === 'private' ? p.visibility === 'private' : true))
+      .sort((a, b) => (a.created < b.created ? 1 : -1))
+      .slice(0, 200)
+      .map(p => publicPost(p, user));
+    json(res, 200, { posts: rows, me: { id: user.id, name: user.name, coach: isAdmin(user) } });
+  },
+
+  'POST /api/community': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    const body = await readBody(req);
+    const text_ = text(body.text).trim().slice(0, 4000);
+    const images = readHashes(body.images);
+    if (!text_ && !images.length) return json(res, 400, { error: 'say something or add a photo' });
+    const post = {
+      id: crypto.randomBytes(9).toString('base64url'),
+      userId: user.id,
+      // Anything that is not the word 'public' is private. A typo, a client from a newer
+      // version, a hand-made request — all of them fail closed.
+      visibility: body.visibility === 'public' ? 'public' : 'private',
+      text: text_, images, created: new Date().toISOString(), edited: null, replies: []
+    };
+    db.posts.push(post);
+    saveDb();
+    json(res, 200, { post: publicPost(post, user) });
+  },
+
+  'POST /api/community/reply': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    const body = await readBody(req);
+    const post = db.posts.find(p => p.id === body.id);
+    // A post this caller may not see is exactly as missing as one that was never written —
+    // otherwise 403-vs-404 tells them a private post exists and who wrote it.
+    if (!post || !canSee(user, post)) return json(res, 404, { error: 'no such post' });
+    const text_ = text(body.text).trim().slice(0, 2000);
+    if (!text_) return json(res, 400, { error: 'say something' });
+    post.replies = post.replies || [];
+    if (post.replies.length >= 500) return json(res, 400, { error: 'this thread is full' });
+    post.replies.push({
+      id: crypto.randomBytes(9).toString('base64url'),
+      userId: user.id, text: text_, created: new Date().toISOString()
+    });
+    saveDb();
+    json(res, 200, { post: publicPost(post, user) });
+  },
+
+  // Authors delete their own; the coach deletes anything, which is the whole of moderation.
+  'POST /api/community/delete': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    const body = await readBody(req);
+    const post = db.posts.find(p => p.id === body.id);
+    if (!post || !canSee(user, post)) return json(res, 404, { error: 'no such post' });
+    if (body.replyId) {
+      const reply = (post.replies || []).find(r => r.id === body.replyId);
+      if (!reply) return json(res, 404, { error: 'no such reply' });
+      if (reply.userId !== user.id && !isAdmin(user)) return json(res, 403, { error: 'not yours to delete' });
+      post.replies = post.replies.filter(r => r.id !== body.replyId);
+    } else {
+      if (post.userId !== user.id && !isAdmin(user)) return json(res, 403, { error: 'not yours to delete' });
+      db.posts = db.posts.filter(p => p.id !== post.id);
+    }
+    saveDb();
+    if (isAdmin(user) && post.userId !== user.id) audit(req, 'admin.post.delete', { user, msg: post.visibility });
+    json(res, 200, { ok: true });
+  },
+
+  /* A photo attached to a post, which is the one place in this app where one account reads
+   * another's file. Every other media route answers out of the caller's own folder, so the
+   * subscription is the whole of it (GET /api/media/{hash}); this one cannot, so it earns the
+   * read: the hash has to be attached to a post the caller is allowed to see, and the bytes come
+   * from that post's author's folder. A hash alone is not a capability. */
+  'GET /api/community/media/{hash}': async (req, res) => {
+    const user = requireActiveSub(req, res);
+    if (!user) return;
+    const owner = db.posts.find(p => canSee(user, p) && (p.images || []).includes(req.mediaHash))?.userId;
+    if (!owner) throw new MediaError(404, 'media-missing');
+    const f = MEDIA.file(owner, req.mediaHash);
+    if (!f) throw new MediaError(404, 'media-missing');
+    await sendMediaFile(res, f, req.mediaHash);
   },
 
   'PUT /api/data': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
     const body = await readBody(req);
     if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
     // An object with nothing of the profile in it empties the document with the counter left
@@ -2043,6 +2515,10 @@ const routes = {
       return json(res, 409, { error: 'conflict', rev: curRev, state: cur });
     }
     delete body.state.active;              // in-progress workouts stay device-local
+    // The program belongs to plan-<uid>.json and only the admin routes write it. Dropped rather
+    // than refused, for the same reason the malformed entries above are: a client holding a copy
+    // from before the split would otherwise re-send it forever and never sync anything again.
+    for (const k of PLAN_KEYS) delete body.state[k];
     // "Reset everything" stamps the profile (`resetAt`, with `resetIds`: what it wiped). The stamp
     // only moves forward: a write without it, or with an older one — a client from before it, a
     // backup restored over the profile — keeps the stored stamp. Otherwise every device that saw
@@ -2155,8 +2631,8 @@ const routes = {
 
   // Live-workout heartbeat: client pings while a workout is on screen; { active:false } drops it.
   'POST /api/activity': async (req, res) => {
-    const user = readSession(req);
-    if (!user) return json(res, 401, { error: 'not signed in' });
+    const user = requireActiveSub(req, res);
+    if (!user) return;
     const body = await readBody(req);
     if (body.active) {
       presence.set(user.id, {
@@ -2178,14 +2654,25 @@ const routes = {
       const S = readState(u.id) || {};
       const workouts = records(S.workouts);
       const last = workouts[workouts.length - 1];
+      const plan = planOf(u.id);
       return {
         id: u.id, name: u.name, created: u.created || null,
-        disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null,
+        disabled: !!u.disabled, admin: isAdmin(u), owner: isOwner(u), invitedBy: u.invitedBy || null,
         workouts: workouts.length,
         lastWorkout: last ? last.d : null,
         lastSync: lastSyncOf(u, S),
         hasPush: db.subs.some(s => s.userId === u.id),
         live: livePresence(u.id),
+        // The coaching columns: what they owe, what they asked for, what they have been given,
+        // and how much of it they are actually doing.
+        sub: subOf(u),
+        goal: record(u.intake) ? u.intake.goal : null,
+        hasIntake: record(u.intake),
+        planReady: planPublished(plan),
+        planUpdatedAt: plan.updatedAt,
+        openRequest: !!myRequest(u.id),
+        device: record(u.device) ? { label: u.device.label || '', boundAt: u.device.boundAt || null } : null,
+        adherence: adherenceOf(workouts, plan),
         // The sign-in e-mail is an admin's to see (to hand out a reset code, to tell two
         // profiles apart), and only while the instance takes passwords at all.
         ...(PASSWORD_LOGIN ? { password: hasPassword(u), email: u.email || null } : {})
@@ -2203,19 +2690,144 @@ const routes = {
     const S = readState(u.id) || {};
     json(res, 200, {
       user: {
-        id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null,
+        id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), owner: isOwner(u), invitedBy: u.invitedBy || null,
         // Only on an instance with password sign-in: whether they have one, and until when an
         // unused reset code is good.
         ...(PASSWORD_LOGIN ? { password: hasPassword(u), email: u.email || null, resetUntil: u.pwReset?.exp > Date.now() ? u.pwReset.exp : null } : {})
       },
+      sub: subOf(u),
+      intake: record(u.intake) ? u.intake : null,
+      request: myRequest(u.id),
+      device: record(u.device) ? { label: u.device.label || '', boundAt: u.device.boundAt || null } : null,
+      plan: planOf(u.id),
       unit: S.unit || 'kg',
       lastSync: lastSyncOf(u, S),
-      routines: records(S.routines).map(r => ({ id: r.id, name: r.name, emoji: r.emoji, count: records(r.ex).length })),
+      // The assigned program. A profile whose document still holds routines has not been through
+      // the lift yet (it was written while the server was down, or by hand), so fall back to it
+      // rather than showing an operator an empty plan for an account that plainly has one.
+      routines: (planOf(u.id).routines.length ? planOf(u.id).routines : records(S.routines))
+        .map(r => ({ id: r.id, name: r.name, emoji: r.emoji, count: records(r.ex).length })),
       bodyweight: records(S.bodyweight),
+      // Sessions logged against sessions prescribed — the same figure the clients list shows,
+      // computed here too so the detail sheet does not have to be opened from that list to
+      // have it.
+      adherence: adherenceOf(records(S.workouts), planOf(u.id)),
       // records() already copied, so this reverse is ours: newest first for display. A workout's
       // photos and videos are the owner's own: the admin view gets no refs to them.
       workouts: records(S.workouts).reverse().map(({ media, ...w }) => w)
     });
+  },
+
+  /* ---------- coaching: plans, subscriptions, devices, requests ---------- */
+
+  // The program the coach is editing for one client.
+  'GET /api/admin/plan': async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const id = text(new URL(req.url, 'http://x').searchParams.get('id'));
+    const u = db.users.find(x => x.id === id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    json(res, 200, { plan: planOf(u.id), user: { id: u.id, name: u.name } });
+  },
+
+  // The only writer of a plan file. `baseRev` guards against two admin tabs overwriting each
+  // other, the same way PUT /api/data guards two client devices.
+  'PUT /api/admin/plan': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === text(body.id));
+    if (!u) return json(res, 404, { error: 'no such user' });
+    if (!record(body.plan)) return json(res, 400, { error: 'plan required' });
+    const cur = planOf(u.id);
+    if (body.baseRev != null && body.baseRev !== cur._rev) {
+      return json(res, 409, { error: 'conflict', rev: cur._rev, plan: cur });
+    }
+    const routines = records(body.plan.routines);
+    const week = record(body.plan.week) ? body.plan.week : {};
+    const next = {
+      routines, week,
+      _rev: cur._rev + 1,
+      updatedAt: new Date().toISOString(),
+      updatedBy: admin.name || admin.id,
+      note: text(body.plan.note).slice(0, 500)
+    };
+    writePlan(u.id, next);
+    audit(req, 'admin.plan.write', { user: admin, target: u, msg: routines.length + ' routines' });
+    json(res, 200, { ok: true, plan: next });
+  },
+
+  // Confirming a payment. There is no provider to reconcile with: the coach sees the transfer,
+  // then sets the date access runs to. Extending never touches the client's data — a renewal
+  // puts them back into exactly the dashboard they were locked out of.
+  'POST /api/admin/user/subscription': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === text(body.id));
+    if (!u) return json(res, 404, { error: 'no such user' });
+    const action = text(body.action);
+    const cur = subOf(u);
+    if (action === 'expire') {
+      u.sub = { ...cur, status: 'expired', paidUntil: Date.now(), note: text(body.note).slice(0, 300) };
+    } else if (action === 'extend' || action === 'activate') {
+      const months = Math.min(24, Math.max(1, Math.round(Number(body.months) || 1)));
+      // Extend from whichever is later: an early renewal should add to the time left, not
+      // silently throw it away, and a lapsed account restarts from today.
+      const from = action === 'extend' && cur.paidUntil && cur.paidUntil > Date.now() ? new Date(cur.paidUntil) : new Date();
+      const until = new Date(from);
+      until.setMonth(until.getMonth() + months);
+      u.sub = {
+        status: 'active', paidUntil: until.getTime(),
+        activatedAt: cur.activatedAt || new Date().toISOString(),
+        note: text(body.note).slice(0, 300)
+      };
+    } else {
+      return json(res, 400, { error: 'action must be activate, extend or expire' });
+    }
+    saveDb();
+    audit(req, 'admin.subscription', { user: admin, target: u, msg: action });
+    json(res, 200, { ok: true, sub: subOf(u) });
+  },
+
+  // Releasing the device lock. The client's next sign-in binds whatever they sign in from, and
+  // every token naming the old device stops verifying the moment this writes.
+  'POST /api/admin/user/device/release': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === text(body.id));
+    if (!u) return json(res, 404, { error: 'no such user' });
+    delete u.device;
+    saveDb();
+    audit(req, 'admin.device.release', { user: admin, target: u });
+    json(res, 200, { ok: true });
+  },
+
+  'GET /api/admin/requests': async (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const byId = new Map(db.users.map(u => [u.id, u]));
+    const rows = db.planRequests.map(r => {
+      const u = byId.get(r.userId);
+      return {
+        ...r,
+        userName: u?.name || '(deleted)',
+        sub: u ? subOf(u) : null,
+        intake: u && record(u.intake) ? u.intake : null,
+        planReady: u ? planPublished(planOf(u.id)) : false
+      };
+    }).sort((a, b) => String(b.created).localeCompare(String(a.created)));
+    json(res, 200, { requests: rows });
+  },
+
+  'POST /api/admin/requests/resolve': async (req, res) => {
+    const admin = requireAdmin(req, res); if (!admin) return;
+    const body = await readBody(req);
+    const r = db.planRequests.find(x => x.id === text(body.id));
+    if (!r) return json(res, 404, { error: 'no such request' });
+    const status = ['open', 'in_progress', 'done'].includes(body.status) ? body.status : 'done';
+    r.status = status;
+    r.adminNote = text(body.adminNote).slice(0, 1000);
+    r.resolvedAt = status === 'done' ? new Date().toISOString() : null;
+    saveDb();
+    audit(req, 'admin.request.resolve', { user: admin, msg: status });
+    json(res, 200, { ok: true, request: r });
   },
 
   'POST /api/admin/user/disable': async (req, res) => {
@@ -2231,6 +2843,39 @@ const routes = {
     saveDb();
     audit(req, u.disabled ? 'admin.user.disable' : 'admin.user.enable', { user: admin, target: u });
     json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
+  },
+
+  /* Hand coach access to a second person, or take it back. The owner's route, not every admin's
+     (requireOwner) — see isOwner above for why the circle of owners cannot be widened from here.
+
+     Revoking ends their sessions on the spot by bumping the session version, rather than letting
+     a coach who was let go keep reading everyone's data until their cookie happens to expire.
+     That also means their next sign-in is a client's: the device lock and the subscription gate
+     both start applying to them, neither of which an admin is ever subject to. */
+  'POST /api/admin/user/role': async (req, res) => {
+    const owner = requireOwner(req, res); if (!owner) return;
+    const body = await readBody(req);
+    const u = db.users.find(x => x.id === body.id);
+    if (!u) return json(res, 404, { error: 'no such user' });
+    if (u.id === owner.id) return json(res, 400, { error: 'you cannot change your own access' });
+    // An owner is granted in the config or the database by someone with a shell. Letting this
+    // route undo that would make the owner removable by exactly the people it outranks.
+    if (isOwner(u)) return json(res, 400, { error: 'that account is an owner — change it in ADMIN_UIDS or db.json' });
+    const make = !!body.admin;
+    if (make === (u.admin === true)) return json(res, 200, { ok: true, id: u.id, admin: make });
+    if (make) {
+      u.admin = true;
+      // A coach is never paywalled or device-bound, so an account being promoted while locked
+      // out of either is simply let in; nothing here has to undo them.
+    } else {
+      delete u.admin;
+      u.sv = sessionVersion(u) + 1;
+      dropDeviceLinks(db, u.id);
+      presence.delete(u.id);
+    }
+    saveDb();
+    audit(req, make ? 'admin.role.grant' : 'admin.role.revoke', { user: owner, target: u });
+    json(res, 200, { ok: true, id: u.id, admin: make });
   },
 
   // Disable locks an account out; this removes it. The one destructive action in the app, so the
@@ -2250,10 +2895,16 @@ const routes = {
     db.users = db.users.filter(x => x.id !== u.id);
     db.creds = (db.creds || []).filter(c => c.userId !== u.id);
     db.subs = (db.subs || []).filter(x => x.userId !== u.id);
+    db.planRequests = db.planRequests.filter(r => r.userId !== u.id);
+    // Their community posts, and their replies under everyone else's.
+    db.posts = db.posts.filter(p => p.userId !== u.id);
+    for (const p of db.posts) if (Array.isArray(p.replies)) p.replies = p.replies.filter(r => r.userId !== u.id);
     dropDeviceLinks(db, u.id);
     presence.delete(u.id);
-    // The training history and any Coach credential of theirs, both outside db.json.
+    // The training history, the coach's program for them, and any Coach credential of theirs —
+    // all three outside db.json.
     try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ }
+    try { fs.unlinkSync(planFile(u.id)); } catch { /* never had one */ }
     try { coachConfig.clearProfileAuth(u.id); } catch { /* nothing stored */ }
     // Their photos and videos — the one place a profile's folder under uploads/ is removed.
     try { MEDIA.removeUser(u.id); } catch (e) { console.error('media: could not remove uploads of', u.id, e.message); }
@@ -2409,10 +3060,10 @@ const server = http.createServer(async (req, res) => {
   try { url = new URL(req.url, 'http://x'); }
   catch { return json(res, 400, { error: 'bad request' }); }
   let key = req.method + ' ' + url.pathname;
-  // The one route with a parameter in its path. Mapped onto its template key here so the table
-  // above stays a plain lookup, and so csrfOk and the catch-all see one name for every file.
-  const mm = /^\/api\/media\/([0-9a-f]{64})$/.exec(url.pathname);
-  if (mm) { key = req.method + ' /api/media/{hash}'; req.mediaHash = mm[1]; }
+  // The routes with a parameter in their path. Mapped onto their template key here so the
+  // table above stays a plain lookup, and so csrfOk and the catch-all see one name per file.
+  const mm = /^\/api\/(community\/)?media\/([0-9a-f]{64})$/.exec(url.pathname);
+  if (mm) { key = req.method + ' /api/' + (mm[1] || '') + 'media/{hash}'; req.mediaHash = mm[2]; }
   const handler = routes[key];
   if (!handler) return json(res, 404, { error: 'not found' });
   if (!csrfOk(req, key)) {
