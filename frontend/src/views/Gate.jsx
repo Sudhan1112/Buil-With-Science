@@ -154,7 +154,8 @@ export default function Gate() {
   const footer = (
     <div className="dim small" style={{ marginTop: 26, lineHeight: 1.6 }}>
       {t('Signed in as {0}.', user?.name || '')}{' '}
-      <a href="#" onClick={e => { e.preventDefault(); signOut() }}>{t('Sign out')}</a>
+      <button type="button" className="link" style={{ background: 'none', border: 0, padding: 0, color: 'inherit', textDecoration: 'underline', cursor: 'pointer' }}
+        onClick={() => signOut({ force: true })}>{t('Sign out')}</button>
     </div>
   )
 

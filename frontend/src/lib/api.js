@@ -19,12 +19,34 @@ export const vault = () => (IS_APPLE ? t('iCloud Keychain') : IS_ANDROID ? t('Go
 // only after the user chooses a passkey action and surface any genuine browser error there.
 export const webauthnOK = () => typeof window.PublicKeyCredential !== 'undefined'
 
-// The paired mobile app (lib/remote.js) is the only caller of these — everywhere else stays on
-// same-origin cookies, so remoteBase/remoteToken stay empty and api() behaves exactly as before.
-let remoteBase = ''
+// The paired mobile app (lib/remote.js) sets these. The Vercel build also does: VITE_API_BASE
+// points at the Render host, and the session token rides in Authorization because a cookie set
+// by onrender.com is a third-party cookie on vercel.app and many browsers drop it.
+const TOKEN_KEY = 'carefit_session_v1'
+let remoteBase = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_API_BASE)
+  ? String(import.meta.env.VITE_API_BASE).replace(/\/+$/, '')
+  : ''
 let remoteToken = null
-export function setRemoteAuth(base, token) { remoteBase = base || ''; remoteToken = token || null }
-
+try { if (remoteBase) remoteToken = localStorage.getItem(TOKEN_KEY) || null } catch { /* private mode */ }
+export function setRemoteAuth(base, token) {
+  remoteBase = base || ''
+  remoteToken = token || null
+  try {
+    if (remoteBase && remoteToken) localStorage.setItem(TOKEN_KEY, remoteToken)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch { /* private mode */ }
+}
+/** Keep a session token the API returned on sign-in / register (Bearer for a cross-origin API). */
+export function rememberSessionToken(token) {
+  if (!remoteBase || !token) return
+  remoteToken = token
+  try { localStorage.setItem(TOKEN_KEY, token) } catch { /* private mode */ }
+}
+export function clearSessionToken() {
+  remoteToken = null
+  try { localStorage.removeItem(TOKEN_KEY) } catch { /* private mode */ }
+}
+export function apiBase() { return remoteBase }
 export { appBase }
 
 // How long one request may take before it counts as no answer at all. A black-holed connection
@@ -33,8 +55,9 @@ export { appBase }
 // sync behind it, silently, for as long as the socket hung. A GET is small; a PUT carries the
 // whole profile over what may be a slow uplink. A caller that knows its request is slow on
 // purpose (the admin's provider test) passes its own `timeout`; 0 means none.
-const TIMEOUT_GET_MS = 20000
-const TIMEOUT_MS = 60000
+// Render free-tier cold starts after ~15 min idle often take 30–60s; 20s was too short.
+const TIMEOUT_GET_MS = 90000
+const TIMEOUT_MS = 120000
 
 const failure = (message, code, status) => Object.assign(new Error(message), { code, status })
 
@@ -48,11 +71,13 @@ export async function api(path, opts) {
   if (MOBILE && !remoteBase) throw failure(t('This phone is not connected to a server.'), 'not-paired', 0)
   const headers = Object.assign({ 'Content-Type': 'application/json' }, init.headers)
   if (remoteToken) headers.Authorization = 'Bearer ' + remoteToken
-  // A paired phone has an absolute base of its own; everyone else is relative to where the app
-  // is served, so a subpath deployment reaches its own API instead of the proxy's root.
+  // A paired phone / Vercel build has an absolute base; same-origin deploys stay relative so a
+  // subpath reaches its own API.
   const url = remoteBase ? remoteBase + path : appBase().replace(/\/$/, '') + path
   const ms = timeout != null ? timeout : (init.method || 'GET').toUpperCase() === 'GET' ? TIMEOUT_GET_MS : TIMEOUT_MS
-  return request(url, Object.assign({}, init, { headers }), ms)
+  // credentials: cookies when the API is same-site; with VITE_API_BASE the Bearer is what
+  // matters, but include still lets SameSite=None cookies through where the browser allows them.
+  return request(url, Object.assign({ credentials: 'include' }, init, { headers }), ms)
 }
 
 // One exchange, bounded by `ms`. No status on the timeout, like a fetch that failed outright: to
@@ -96,7 +121,8 @@ export function beacon(path, body) {
   if (MOBILE) return false
   try {
     if (typeof navigator === 'undefined' || typeof navigator.sendBeacon !== 'function') return false
-    return !!navigator.sendBeacon(appBase().replace(/\/$/, '') + path, new Blob([JSON.stringify(body)], { type: 'application/json' }))
+    const url = (remoteBase || appBase().replace(/\/$/, '')) + path
+    return !!navigator.sendBeacon(url, new Blob([JSON.stringify(body)], { type: 'application/json' }))
   } catch { return false }
 }
 
@@ -135,7 +161,7 @@ export async function apiBlob(path, { expectSize, idleMs = 30000, fetchImpl = gl
   const orStall = p => { p.catch(() => {}); return Promise.race([p, stall]) }
   arm()
   try {
-    const r = await orStall(fetchImpl(mediaUrl(path), { headers: mediaHeaders(), cache: 'no-store', ...(ctl ? { signal: ctl.signal } : {}) }))
+    const r = await orStall(fetchImpl(mediaUrl(path), { headers: mediaHeaders(), credentials: 'include', cache: 'no-store', ...(ctl ? { signal: ctl.signal } : {}) }))
     if (!r.ok) {
       let body = null
       try { body = await r.json() } catch { /* not JSON: a proxy's page */ }
@@ -182,6 +208,7 @@ export function apiUpload(path, blob, mime, { onProgress, idleMs = 60000, XHR = 
     let idle = false
     const arm = () => { clearTimeout(timer); timer = setTimeout(() => { idle = true; xhr.abort() }, idleMs) }
     xhr.open('PUT', mediaUrl(path))
+    xhr.withCredentials = true
     xhr.setRequestHeader('Content-Type', mime)
     for (const [k, v] of Object.entries(mediaHeaders())) xhr.setRequestHeader(k, v)
     if (xhr.upload) xhr.upload.onprogress = e => { arm(); if (onProgress && e.lengthComputable) onProgress(e.loaded, e.total) }
@@ -260,6 +287,7 @@ export async function passkeyRegister(name, code) {
   const { cid, options } = await api('/api/register/options', { method: 'POST', body: JSON.stringify({ name, code: code || '' }) })
   const cred = await navigator.credentials.create({ publicKey: toCreationOptions(options) })
   const res = await api('/api/register/verify', { method: 'POST', body: JSON.stringify({ cid, credential: credToJSON(cred), deviceId: deviceId() }) })
+  rememberSessionToken(res.token)
   return res.user
 }
 // One passkey ceremony, not yet sent anywhere: /api/login/verify turns it into a sign-in, and
@@ -273,6 +301,7 @@ export async function passkeyAssertion({ signal } = {}) {
 }
 export async function passkeyLogin() {
   const res = await api('/api/login/verify', { method: 'POST', body: JSON.stringify({ ...await passkeyAssertion(), deviceId: deviceId() }) })
+  rememberSessionToken(res.token)
   return res.user
 }
 // A creation ceremony on options the server has already handed out: another passkey for a
@@ -293,13 +322,19 @@ const post = (path, body) => api(path, { method: 'POST', body: JSON.stringify(bo
 // the server matches against the profile's sign-in e-mail when it holds an "@" and against the
 // name otherwise — so the app and a server a version apart still understand each other.
 export async function passwordLogin(name, password) {
-  return (await post('/api/login/password', { name, password, deviceId: deviceId() })).user
+  const res = await post('/api/login/password', { name, password, deviceId: deviceId() })
+  rememberSessionToken(res.token)
+  return res.user
 }
 // `email` is optional, and sent only when there is one: a server from before the field would
 // otherwise ignore it without a word, which is the same thing.
 export async function passwordRegister(name, password, code, email) {
-  return (await post('/api/register/password', { name, password, code: code || '', deviceId: deviceId(), ...(email ? { email } : {}) })).user
+  const res = await post('/api/register/password', { name, password, code: code || '', deviceId: deviceId(), ...(email ? { email } : {}) })
+  rememberSessionToken(res.token)
+  return res.user
 }
 export async function passwordResetRedeem(name, code, next) {
-  return (await post('/api/login/password-reset', { name, code, next, deviceId: deviceId() })).user
+  const res = await post('/api/login/password-reset', { name, code, next, deviceId: deviceId() })
+  rememberSessionToken(res.token)
+  return res.user
 }

@@ -31,6 +31,8 @@ import {
 } from './passkeys-store.js';
 import { createDeviceLink, findDeviceLink, burnDeviceLink, dropDeviceLinks } from './device-link.js';
 import { createMediaStore, mediaLimits, mediaConfig, MediaError, HASH_RE } from './media.js';
+import { createSupabaseMediaStore } from './media-supabase.js';
+import { openStore } from './store.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
@@ -72,29 +74,26 @@ const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
 
-fs.mkdirSync(DATA, { recursive: true });
-/* The secrets are locked down file by file rather than by sealing the whole directory.
- *
- * A blanket `chmod 0700` on DATA looks stronger and is worse: ./data is a host bind mount and
- * this container runs as root, so it lands on the host as root-owned 0700 and anything else
- * the owner runs against their own data directory — a backup script, the MCP server in #19,
- * their own `jq` — gets EACCES on files that are theirs. Locking the four files that actually
- * hold secrets keeps the Coach runtime out of them without taking the directory hostage.
- *
- * Best-effort throughout: a bind-mounted host filesystem may refuse chmod, and that is not a
- * reason to refuse to boot. The privilege drop in adapters/spawn.js is the control that does
- * fail closed. */
-const lock = f => { try { fs.chmodSync(path.join(DATA, f), 0o600); } catch { /* not present yet, or host says no */ } };
-['secret', 'db.json', 'coach.json'].forEach(lock);
-
-/* ---------- secret + db ---------- */
-const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
-
-const dbFile = path.join(DATA, 'db.json');
-let db = { users: [], creds: [], subs: [], invites: [] };
-try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
+/* ---------- secret + db (files under DATA_DIR, or Supabase when configured) ---------- */
+const store = await openStore({ dataDir: DATA });
+if (store.kind === 'file') {
+  fs.mkdirSync(DATA, { recursive: true });
+  /* The secrets are locked down file by file rather than by sealing the whole directory.
+   *
+   * A blanket `chmod 0700` on DATA looks stronger and is worse: ./data is a host bind mount and
+   * this container runs as root, so it lands on the host as root-owned 0700 and anything else
+   * the owner runs against their own data directory — a backup script, the MCP server in #19,
+   * their own `jq` — gets EACCES on files that are theirs. Locking the four files that actually
+   * hold secrets keeps the Coach runtime out of them without taking the directory hostage.
+   *
+   * Best-effort throughout: a bind-mounted host filesystem may refuse chmod, and that is not a
+   * reason to refuse to boot. The privilege drop in adapters/spawn.js is the control that does
+   * fail closed. */
+  const lock = f => { try { fs.chmodSync(path.join(DATA, f), 0o600); } catch { /* not present yet, or host says no */ } };
+  ['secret', 'db.json', 'coach.json'].forEach(lock);
+}
+const SECRET = store.secret;
+let db = store.db;
 db.subs = db.subs || [];
 db.invites = db.invites || [];
 db.deviceLinks = db.deviceLinks || [];   // unused one-time device links, hashed (device-link.js)
@@ -223,15 +222,13 @@ function adherenceOf(workouts, plan) {
   const pct = (done, days) => Math.min(100, Math.round((done / (perWeek * days / 7)) * 100));
   return { d7: pct(since(7), 7), d28: pct(since(28), 28), perWeek };
 }
-// 0600: db.json holds passkey credential material. It used to be covered by a blanket 0700 on
-// the whole directory; now that the directory stays traversable, the file carries its own mode.
-function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2), 0o600); }
-function atomicWrite(file, content, mode) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, content, mode ? { mode } : undefined);
-  fs.renameSync(tmp, file);
+// Persist the in-memory `db` (file atomic write, or Supabase upsert). Always returns a Promise.
+async function saveDb() {
+  store.db = db;
+  try { await store.saveDb(); }
+  catch (e) { console.error('db save failed', e.message); throw e; }
 }
-const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
+const persistDb = () => { saveDb().catch(e => console.error('db save failed', e.message)); };
 // When a profile last fetched its document (GET /api/data). The document's own `_ts` moves only
 // on a push, so a device that only ever read — a second phone, a profile that trains elsewhere
 // and just looks — showed "last sync never" in the admin dashboard (QA 1.3.9). Kept on the user
@@ -240,13 +237,12 @@ const PULL_NOTE_MS = 10 * 60 * 1000;
 function notePull(user, now = Date.now()) {
   if (user.lastPull && now - user.lastPull < PULL_NOTE_MS) return;
   user.lastPull = now;
-  try { saveDb(); } catch (e) { console.error('db save failed', e.message); }
+  persistDb();
 }
 // The later of the last push and the last pull.
 const lastSyncOf = (u, S) => Math.max(S?._ts || 0, u?.lastPull || 0) || null;
-function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
-}
+function readState(uid) { return store.readState(uid); }
+async function writeState(uid, doc) { await store.writeState(uid, doc); }
 // An entry is an object a reader can dereference, and `records` is every entry of a stored
 // list. PUT /api/data drops the rest on the way in — a null workout, a routine that is a
 // number — and refuses a list that is not an array at all, but a file written before it did
@@ -267,12 +263,9 @@ const records = v => (Array.isArray(v) ? v.filter(record) : []);
  * `dayPlan` deliberately stays in the client's own document: that one is "I'm doing Monday's
  * session on Tuesday", which is rescheduling, not programming.
  */
-const planFile = uid => path.join(DATA, 'plan-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
 const PLAN_KEYS = ['routines', 'week'];
 const emptyPlan = () => ({ routines: [], week: {}, _rev: 0, updatedAt: null, updatedBy: null, note: '' });
-function readPlan(uid) {
-  try { return JSON.parse(fs.readFileSync(planFile(uid), 'utf8')); } catch { return null; }
-}
+function readPlan(uid) { return store.readPlan(uid); }
 // Same shape every reader can rely on, whatever is (or isn't) on disk.
 function planOf(uid) {
   const p = readPlan(uid);
@@ -286,8 +279,8 @@ function planOf(uid) {
     note: typeof p.note === 'string' ? p.note : ''
   };
 }
-function writePlan(uid, next) {
-  atomicWrite(planFile(uid), JSON.stringify(next));
+async function writePlan(uid, next) {
+  await store.writePlan(uid, next);
   return next;
 }
 // Has the coach published anything yet? Drives the client's "your plan is being prepared" gate.
@@ -297,9 +290,9 @@ const planPublished = p => p._rev > 0 && (p.routines.length > 0 || Object.keys(p
  * a plan file is skipped, so restarting the server is free. The keys are removed from the state
  * file in the same pass: two copies of the program with only one writable is the kind of thing
  * that reads fine and then drifts. */
-function migratePlans() {
+async function migratePlans() {
   for (const user of db.users) {
-    if (fs.existsSync(planFile(user.id))) continue;
+    if (store.planExists(user.id)) continue;
     let S;
     try { S = readState(user.id); } catch { continue; }
     if (!record(S)) continue;
@@ -308,7 +301,7 @@ function migratePlans() {
     const hadKeys = PLAN_KEYS.some(k => S[k] !== undefined);
     if (!hadKeys) continue;
     try {
-      writePlan(user.id, {
+      await writePlan(user.id, {
         routines, week,
         _rev: routines.length || Object.keys(week).length ? 1 : 0,
         updatedAt: new Date().toISOString(), updatedBy: null,
@@ -316,19 +309,21 @@ function migratePlans() {
       });
       for (const k of PLAN_KEYS) delete S[k];
       S._rev = (Number(S._rev) || 0) + 1;
-      atomicWrite(stateFile(user.id), JSON.stringify(S));
+      await writeState(user.id, S);
     } catch (e) {
       console.error('plan migration failed for', user.id, e.message);
     }
   }
 }
-migratePlans();
+await migratePlans();
 
 /* ---------- push notifications (Web Push / VAPID) ---------- */
-const vapidFile = path.join(DATA, 'vapid.json');
 let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+if (store.kind === 'supabase' && store.bootVapid) {
+  vapid = await store.bootVapid(() => webpush.generateVAPIDKeys());
+} else {
+  vapid = store.loadVapid(() => webpush.generateVAPIDKeys());
+}
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
 webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
 
@@ -475,7 +470,7 @@ async function sendPush(userId, payload, deviceId) {
   // unhandled rejection and take the process down. The row is already gone from db.subs in
   // memory, so only the copy on disk lags: the next saveDb() that succeeds, from any route,
   // writes it out, and a restart re-reads the old file and prunes it again on the next send.
-  if (dirty) { try { saveDb(); } catch (e) { console.error('push: could not save db.json', e.message); } }
+  if (dirty) persistDb();
 }
 
 // Rest-timer alerts: client schedules on start/extend, cancels on skip or on-screen completion —
@@ -562,8 +557,8 @@ const STATE_CACHE_MAX = 64;
 const STATE_CACHE_TTL_MS = Math.max(50, +(process.env.STATE_CACHE_TTL_MS || 600000) || 600000);
 const stateCache = new Map(); // uid -> { mtimeMs, size, hitAt, S }
 function readStateCached(uid) {
-  let st;
-  try { st = fs.statSync(stateFile(uid)); } catch { stateCache.delete(uid); return null; }
+  const st = store.stateStat(uid);
+  if (!st) { stateCache.delete(uid); return null; }
   const now = Date.now();
   for (const [k, v] of stateCache) if (now - v.hitAt > STATE_CACHE_TTL_MS) stateCache.delete(k);
   const hit = stateCache.get(uid);
@@ -598,7 +593,7 @@ setInterval(() => {
       const routine = (S.routines || []).find(r => r?.id === rid);
       console.log('reminder firing', user.id, rid);
       user.lastReminder = now.date;
-      saveDb();
+      persistDb();
       sendPush(user.id, dayReminderPush(S.lang, routine));
     } catch (e) {
       console.error('reminder tick', user.id, e);
@@ -668,7 +663,7 @@ function claimDevice(user, rawId, req) {
   // bound: binding a blank would lock the account to every such caller at once.
   if (!deviceId) return { deviceId: '' };
   user.device = { id: deviceId, label: deviceLabel(req), boundAt: new Date().toISOString() };
-  try { saveDb(); } catch (e) { console.error('db save failed', e.message); }
+  persistDb();
   audit(req, 'auth.device.bound', { user });
   return { deviceId };
 }
@@ -773,9 +768,13 @@ function requireActiveSub(req, res) {
   }
   return user;
 }
-const expireCookie = name => `${name}=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=Lax`;
+/* SameSite=None when the page and the API are different sites (Vercel → Render). Lax would keep
+   the session cookie off every fetch from *.vercel.app to *.onrender.com. Secure is already
+   required for None, and for the __Host- name. Localhost stays Lax. */
+const SAME_SITE = SECURE ? 'None' : 'Lax';
+const expireCookie = name => `${name}=; Path=/; Max-Age=0; HttpOnly;${SECURE} SameSite=${SAME_SITE}`;
 function sessionCookie(user, deviceId = '') {
-  const fresh = `${COOKIE}=${makeSession(user, deviceId)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=Lax`;
+  const fresh = `${COOKIE}=${makeSession(user, deviceId)}; Path=/; Max-Age=${SESSION_DAYS * 86400}; HttpOnly;${SECURE} SameSite=${SAME_SITE}`;
   // Signing in also retires any pre-upgrade cookie, so nobody is left carrying an unprefixed one
   // (or a shadowing copy of it) alongside the new session.
   return COOKIE === LEGACY_COOKIE ? [fresh] : [fresh, expireCookie(LEGACY_COOKIE)];
@@ -789,7 +788,11 @@ const clearCookie = COOKIE === LEGACY_COOKIE
 function grantSession(req, res, user, body, extra) {
   const claim = claimDevice(user, body?.deviceId, req);
   if (claim.error) return json(res, 409, claim.error);
-  json(res, 200, { user: publicUser(user), account: accountState(user), ...(extra || {}) }, { 'Set-Cookie': sessionCookie(user, claim.deviceId) });
+  // `token` is the same payload as the cookie: the Vercel app stores it and sends Bearer when
+  // the API is on another host, because some browsers drop cross-site cookies even with
+  // SameSite=None. Same-origin deploys keep using the cookie and may ignore the field.
+  const token = makeSession(user, claim.deviceId);
+  json(res, 200, { user: publicUser(user), account: accountState(user), token, ...(extra || {}) }, { 'Set-Cookie': sessionCookie(user, claim.deviceId) });
 }
 
 /* ---------- CSRF ---------- */
@@ -820,15 +823,15 @@ function csrfOk(req, key) {
   // The paired mobile app authenticates with a Bearer token. A browser never attaches one on its
   // own, so there is no ambient authority for a hostile page to borrow and no origin to check.
   if ((req.headers.authorization || '').startsWith('Bearer ')) return true;
-  // Sec-Fetch-Site is set by the browser itself and no page can forge it, and it states exactly
-  // the property wanted here — more precisely than comparing origins can. 'same-origin' is the
-  // app talking to its own backend; a hostile page reports 'cross-site'; a sibling subdomain,
-  // the case SameSite=Lax misses entirely, reports 'same-site'. It is also what keeps the Vite
-  // dev server working, where the page is on another port and its Origin is legitimately not
-  // ORIGIN. Absent on older Safari and on proxies that strip it, hence the fallback below.
+  // Sec-Fetch-Site is set by the browser itself and no page can forge it. 'same-origin' is the
+  // app talking to its own backend (nginx / Vite proxy). A Vercel page talking to Render reports
+  // 'cross-site' even when Origin is ours — that is the intended CareFit deploy, so we also
+  // accept an Origin that exactly matches ORIGIN. A hostile page reports 'cross-site' with a
+  // different Origin and is refused. Absent Sec-Fetch-Site (older Safari, some proxies), the
+  // Origin comparison below is the whole of it.
   const site = req.headers['sec-fetch-site'];
-  if (site) return site === 'same-origin' || site === 'none';
   const origin = req.headers.origin;
+  if (site === 'same-origin' || site === 'none') return true;
   // No Origin header at all means no browser sent this — curl, a script, a monitoring check.
   // Browsers put an Origin on every state-changing request and a page cannot suppress it, so the
   // forgery this exists to stop always carries one.
@@ -961,7 +964,6 @@ const AUDIT_MAX = Math.max(0, +(process.env.AUDIT_MAX || 5000) || 0);     // 0 =
 const AUDIT_DAYS = Math.max(0, +(process.env.AUDIT_DAYS || 90) || 0);     // 0 = no age cap
 const AUDIT_IP = /^full$/i.test(process.env.AUDIT_IP || '') ? 'full'
   : /^(1|true|yes|on|net)$/i.test(process.env.AUDIT_IP || '') ? 'net' : 'off';
-const auditFile = path.join(DATA, 'audit.log');
 let auditSeq = 0;      // never reset, not even by a clear — a wiped log leaves a visible id gap
 let auditCount = 0;
 
@@ -988,16 +990,7 @@ function clientIp(req) {
   return g ? g + '::/48' : null;
 }
 
-function auditLines() {
-  let text;
-  try { text = fs.readFileSync(auditFile, 'utf8'); } catch { return []; }
-  const rows = [];
-  for (const line of text.split('\n')) {
-    if (!line) continue;
-    try { const r = JSON.parse(line); if (r && r.id && r.ev) rows.push(r); } catch { /* torn line */ }
-  }
-  return rows;
-}
+function auditLines() { return store.auditLines(); }
 // Retention is a cap, not an archive: age first, then the newest AUDIT_MAX of what's left.
 function auditKeep(rows) {
   let out = rows;
@@ -1005,13 +998,16 @@ function auditKeep(rows) {
   if (AUDIT_MAX && out.length > AUDIT_MAX) out = out.slice(out.length - AUDIT_MAX);
   return out;
 }
-function compactAudit() {
+async function compactAudit() {
+  if (store.refreshAudit) {
+    try { await store.refreshAudit(); } catch (e) { console.error('audit refresh failed', e.message); }
+  }
   const rows = auditLines();
   for (const r of rows) if (+r.id > auditSeq) auditSeq = +r.id;
   const keep = auditKeep(rows);
   auditCount = keep.length;
   if (keep.length === rows.length) return;
-  try { atomicWrite(auditFile, keep.map(r => JSON.stringify(r)).join('\n') + (keep.length ? '\n' : '')); }
+  try { store.writeAuditLines(keep); }
   catch (e) { console.error('audit compact failed', e.message); }
 }
 
@@ -1030,14 +1026,14 @@ function audit(req, ev, f = {}) {
   if (f.act) rec.act = String(f.act).slice(0, 40);
   const ip = clientIp(req);
   if (ip) rec.ip = ip;
-  try { fs.appendFileSync(auditFile, JSON.stringify(rec) + '\n'); }
+  try { store.appendAudit(rec); }
   catch (e) { return console.error('audit write failed', e.message); }
   // Amortized: a 5000-event cap rewrites the file once per ~1250 events.
-  if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) compactAudit();
+  if (AUDIT_MAX && ++auditCount > AUDIT_MAX * 1.25) void compactAudit();
 }
 if (AUDIT_ON) {
-  compactAudit();                                // prune on boot, seed auditSeq/auditCount
-  setInterval(compactAudit, 3600000).unref();    // honour AUDIT_DAYS on an idle instance too
+  await compactAudit();                          // prune on boot, seed auditSeq/auditCount
+  setInterval(() => { void compactAudit(); }, 3600000).unref();
 }
 
 /* ---------- sign-in throttle ---------- */
@@ -1368,7 +1364,7 @@ async function removeEmail(req, res, user, body) {
   if (!proof) return;
   if (readSession(req) !== user) return json(res, 401, { error: 'not signed in' });
   delete user.email;
-  saveDb();
+  await saveDb();
   audit(req, 'auth.email.remove', { user, msg: proof });
   json(res, 200, { ok: true, email: null });
 }
@@ -1407,7 +1403,7 @@ const passwordRoutes = {
     if (needsRehash(rec.h)) {
       try {
         const h = await hashPassword(pw);
-        if (still()) { rec.h = h; saveDb(); }
+        if (still()) { rec.h = h; await saveDb(); }
       } catch (e) { if (!(e instanceof BusyError)) throw e; }
       // The same question again: the password may have changed while the new hash was made.
       if (!still()) return json(res, 401, WRONG);
@@ -1463,7 +1459,7 @@ const passwordRoutes = {
     const user = { id: crypto.randomBytes(12).toString('base64url'), name, created, sub: newSub(), pw: { h, set: created }, ...(email ? { email } : {}) };
     if (inv) { user.invitedBy = inv.code; inv.usedBy = user.id; inv.usedAt = created; }
     db.users.push(user);
-    saveDb();
+    await saveDb();
     audit(req, 'auth.register.ok', { user, msg: inv ? inv.code + ' · password' : 'password' });
     grantSession(req, res, user, body);
   },
@@ -1502,7 +1498,7 @@ const passwordRoutes = {
     setPassword(user, h);
     // Whatever pause wrong guesses put on this account was about a password that no longer exists.
     ACCOUNT_FAILS.clear(acctKey(user));
-    saveDb();
+    await saveDb();
     audit(req, first ? 'auth.password.set' : 'auth.password.change', { user, msg: proof });
     // This session carries on under the new version: a new cookie, or a new token for a phone.
     if (s.bearer) return json(res, 200, { ok: true, token: makeSession(user) });
@@ -1526,11 +1522,11 @@ const passwordRoutes = {
     // Everything above awaited: the session may have ended, and the profile's last passkey may
     // have been removed by a request that ran alongside this one.
     if (readSession(req) !== user) return json(res, 401, { error: 'not signed in' });
-    if (proof === 'passkey') saveDb();   // the confirming passkey's counter and last use
+    if (proof === 'passkey') await saveDb();   // the confirming passkey's counter and last use
     if (!hasPassword(user)) return json(res, 200, { ok: true });
     if (!passkeyCount(user)) return lastWayIn();
     delete user.pw;
-    saveDb();
+    await saveDb();
     audit(req, 'auth.password.remove', { user });
     json(res, 200, { ok: true });
   },
@@ -1562,7 +1558,7 @@ const passwordRoutes = {
     if (sessionOf(req)?.user !== user) return json(res, 401, { error: 'not signed in' });
     if (paused()) return;
     if (emailTaken(email, user.id)) {
-      if (proof === 'passkey') saveDb();   // the confirming passkey's counter and last use
+      if (proof === 'passkey') await saveDb();   // the confirming passkey's counter and last use
       strikeAddress(req, 'email');
       ADDR_FAILS.fail(acct);
       audit(req, 'auth.email.fail', { ok: false, user, msg: 'email-taken' });
@@ -1570,7 +1566,7 @@ const passwordRoutes = {
     }
     const first = !user.email;
     user.email = email;
-    saveDb();
+    await saveDb();
     audit(req, first ? 'auth.email.set' : 'auth.email.change', { user, msg: proof + ' · ' + maskEmail(email) });
     json(res, 200, { ok: true, email });
   },
@@ -1600,7 +1596,7 @@ const passwordRoutes = {
     for (const [k, v] of pairings) if (v.uid === u.id) pairings.delete(k);
     dropDeviceLinks(db, u.id);
     presence.delete(u.id);
-    saveDb();
+    await saveDb();
     audit(req, 'admin.password.reset', { user: admin, target: u });
     json(res, 200, { ok: true, name: u.name, code, expires: u.pwReset.exp });
   },
@@ -1638,7 +1634,7 @@ const passwordRoutes = {
     if (nameTaken(user.name, user.id)) return taken();
     setPassword(user, h);
     ACCOUNT_FAILS.clear(acctKey(user));
-    saveDb();
+    await saveDb();
     audit(req, 'auth.password.reset', { user });
     grantSession(req, res, user, body);
   }
@@ -1737,7 +1733,7 @@ const passkeyRoutes = {
     if (!proof) return;
     // Awaited: a sign-out everywhere, a disable or an admin reset may have ended this session.
     if (readSession(req) !== user) return notSignedIn(res);
-    if (proof === 'passkey') saveDb();   // the confirming passkey's counter and last use
+    if (proof === 'passkey') await saveDb();   // the confirming passkey's counter and last use
     const options = await moreOptions(user);
     const cid = putChallenge({ challenge: options.challenge, uid: user.id, kind: 'add', sv: sessionVersion(user), proof });
     json(res, 200, { cid, options });
@@ -1760,7 +1756,7 @@ const passkeyRoutes = {
       audit(req, 'auth.passkey.fail', { ok: false, user, msg: added.code });
       return json(res, 409, { error: added.error, code: added.code });
     }
-    saveDb();
+    await saveDb();
     audit(req, 'auth.passkey.add', { user, msg: c.proof });
     json(res, 200, { ok: true, ...passkeyState(user) });
   },
@@ -1771,7 +1767,7 @@ const passkeyRoutes = {
     const body = await readBody(req);
     const r = renamePasskeyRecord(db, user.id, text(body.id), body.name);
     if (r.error) return json(res, 404, { error: r.error, code: r.code });
-    saveDb();
+    await saveDb();
     json(res, 200, { ok: true, ...passkeyState(user) });
   },
 
@@ -1793,11 +1789,11 @@ const passkeyRoutes = {
     const proof = await proveOwner(req, res, user, body, 'passkey-remove');
     if (!proof) return;
     if (readSession(req) !== user) return notSignedIn(res);
-    if (proof === 'passkey') saveDb();   // the confirming passkey's counter and last use
+    if (proof === 'passkey') await saveDb();   // the confirming passkey's counter and last use
     const r = removePasskeyRecord(db, user.id, id, passwordWayIn(user) ? 1 : 0);
     if (r.error) return refuse(r);
     dropDeviceLinks(db, user.id);
-    saveDb();
+    await saveDb();
     audit(req, 'auth.passkey.remove', { user, msg: r.row.name || null });
     json(res, 200, { ok: true, ...passkeyState(user) });
   },
@@ -1813,7 +1809,7 @@ const passkeyRoutes = {
     if (!proof) return;
     if (readSession(req) !== user) return notSignedIn(res);
     const { code, link } = createDeviceLink(db, user.id);
-    saveDb();
+    await saveDb();
     audit(req, 'auth.link.create', { user, msg: proof });
     json(res, 200, { code, expires: link.exp });
   },
@@ -1882,7 +1878,7 @@ const passkeyRoutes = {
     }
     added.row.lastUsed = added.row.created;
     burnDeviceLink(db, link);
-    saveDb();
+    await saveDb();
     audit(req, 'auth.link.ok', { user, msg: added.row.name || null });
     grantSession(req, res, user, body);
   }
@@ -1898,14 +1894,25 @@ const MEDIA_ON = MEDIA_LIMITS.enabled;
 // `extraRefs`: photos attached to community posts live in db.json, not in the profile's synced
 // document, so without this the sweeper would see them as unreferenced and delete the picture
 // out from under a post that still shows it.
-const MEDIA = createMediaStore({
-  dir: path.join(DATA, 'uploads'),
-  limits: MEDIA_LIMITS,
-  readState,
-  extraRefs: uid => db.posts.filter(p => p.userId === uid).flatMap(p => p.images || [])
-});
+const MEDIA = store.kind === 'supabase'
+  ? createSupabaseMediaStore({
+      client: store.client,
+      limits: MEDIA_LIMITS,
+      readState,
+      extraRefs: uid => db.posts.filter(p => p.userId === uid).flatMap(p => p.images || [])
+    })
+  : createMediaStore({
+      dir: path.join(DATA, 'uploads'),
+      limits: MEDIA_LIMITS,
+      readState,
+      extraRefs: uid => db.posts.filter(p => p.userId === uid).flatMap(p => p.images || [])
+    });
 // Leftovers of uploads the previous process was receiving when it stopped.
 try { MEDIA.cleanTmp(); } catch (e) { console.error('media: boot cleanup failed', e.message); }
+if (MEDIA.warm) {
+  try { await MEDIA.warm(db.users.map(u => u.id)); }
+  catch (e) { console.error('media: warm failed', e.message); }
+}
 // Per profile, not per address: every upload is signed in, and behind a proxy one address can be
 // a whole household. The hourly budget is generous (an import of a backup re-uploads everything
 // at once); the two-in-flight cap in media.js is what keeps one phone from holding many sockets.
@@ -1932,9 +1939,9 @@ function mediaThrottle(req, user, win) {
 // profiles in db.json are swept, and only when their state parses (see media.js for why a
 // missing anything never means "delete"). First pass a few minutes after boot, so an instance
 // that is redeployed more often than hourly still gets one.
-function mediaSweepAll() {
+async function mediaSweepAll() {
   try {
-    const r = MEDIA.sweepAll({ uids: db.users.map(u => u.id) });
+    const r = await Promise.resolve(MEDIA.sweepAll({ uids: db.users.map(u => u.id) }));
     if (r.removed || r.tmp) console.log(`media: swept ${r.removed} unreferenced file(s), ${(r.freedBytes / 1048576).toFixed(1)} MB, ${r.tmp} stale upload(s)`);
   } catch (e) { console.error('media: sweep failed', e); }
 }
@@ -1950,23 +1957,30 @@ if (MEDIA_ON) {
 // keeps a copy out of the HTTP cache — the app's own media store is the only client cache, and
 // an HTTP-cache copy would outlive the sign-out purge. No Range and no ETag: nothing asks.
 async function sendMediaFile(res, f, hash) {
+  // cross-origin: Vercel must be able to read media from Render (CORP same-origin would block it).
+  const corp = SECURE ? 'cross-origin' : 'same-origin';
+  const headers = {
+    'Content-Type': f.mime,
+    'Cache-Control': 'private, no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Security-Policy': "default-src 'none'; sandbox",
+    'Cross-Origin-Resource-Policy': corp,
+    'Content-Disposition': `inline; filename="${hash}.${f.ext}"`,
+    'X-Robots-Tag': 'noindex',
+    'Access-Control-Expose-Headers': 'Content-Length'
+  };
+  if (f.buffer) {
+    headers['Content-Length'] = String(f.buffer.length);
+    res.writeHead(200, headers);
+    res.end(f.buffer);
+    return;
+  }
   let fd;
   try { fd = fs.openSync(f.path, 'r'); }
   catch { throw new MediaError(404, 'media-missing'); }   // swept between the lookup and here
   const size = fs.fstatSync(fd).size;
-  res.writeHead(200, {
-    'Content-Type': f.mime,
-    'Content-Length': String(size),
-    'Cache-Control': 'private, no-store',
-    'X-Content-Type-Options': 'nosniff',
-    'Content-Security-Policy': "default-src 'none'; sandbox",
-    'Cross-Origin-Resource-Policy': 'same-origin',
-    'Content-Disposition': `inline; filename="${hash}.${f.ext}"`,
-    'X-Robots-Tag': 'noindex',
-    // The paired phone reads the length before the body to refuse an oversized answer; it is
-    // CORS-safelisted already, this only spells it out for older WebViews.
-    'Access-Control-Expose-Headers': 'Content-Length'
-  });
+  headers['Content-Length'] = String(size);
+  res.writeHead(200, headers);
   try { await pipeline(fs.createReadStream(null, { fd }), res); }
   catch { res.destroy(); }   // the client went away mid-download; nothing left to answer
 }
@@ -1992,7 +2006,7 @@ const mediaRoutes = {
     if (!user) return;
     // Only ever the caller's own folder: another profile's file is exactly as missing as one
     // that was never uploaded.
-    const f = MEDIA.file(user.id, req.mediaHash);
+    const f = await Promise.resolve(MEDIA.file(user.id, req.mediaHash));
     if (!f) throw new MediaError(404, 'media-missing');
     await sendMediaFile(res, f, req.mediaHash);
   },
@@ -2006,7 +2020,7 @@ const mediaRoutes = {
     if (!Array.isArray(hashes) || hashes.length > 1000 || !hashes.every(h => typeof h === 'string' && HASH_RE.test(h))) {
       throw new MediaError(400, 'bad-request', { error: 'hashes must be a list of at most 1000 lowercase sha256 hex strings' });
     }
-    json(res, 200, MEDIA.missing(user.id, hashes));
+    json(res, 200, await Promise.resolve(MEDIA.missing(user.id, hashes)));
   },
   // "Reset everything": every file the caller's current state does not reference goes now,
   // without the grace. A state that cannot be read removes nothing.
@@ -2015,9 +2029,10 @@ const mediaRoutes = {
     if (!user) return;
     await readBody(req);
     mediaThrottle(req, user, MEDIA_SWEEPS);
-    const r = MEDIA.sweep(user.id, { graceMs: 0 });
+    const r = await Promise.resolve(MEDIA.sweep(user.id, { graceMs: 0 }));
+    const usage = MEDIA.usageAsync ? await MEDIA.usageAsync(user.id) : MEDIA.usage(user.id);
     audit(req, 'media.sweep', { user, msg: `${r.removed} file(s), ${(r.freedBytes / 1048576).toFixed(1)} MB${r.skipped ? ', state unreadable' : ''}` });
-    json(res, 200, { removed: r.removed, freedBytes: r.freedBytes, usage: MEDIA.usage(user.id) });
+    json(res, 200, { removed: r.removed, freedBytes: r.freedBytes, usage });
   }
 };
 
@@ -2146,7 +2161,7 @@ const routes = {
       // What Settings → Passkeys shows (#95); a passkey from before then has neither.
       created: user.created, lastUsed: user.created
     });
-    saveDb();
+    await saveDb();
     audit(req, 'auth.register.ok', { user, msg: invite ? invite.code : null });
     grantSession(req, res, user, body);
   },
@@ -2199,7 +2214,7 @@ const routes = {
     }
     cred.counter = verification.authenticationInfo.newCounter;
     cred.lastUsed = new Date().toISOString();
-    saveDb();
+    await saveDb();
     const user = db.users.find(u => u.id === cred.userId);
     if (!user) {
       audit(req, 'auth.login.fail', { ok: false, uid: cred.userId, msg: 'user-missing' });
@@ -2233,7 +2248,7 @@ const routes = {
     // does an unused device link.
     for (const [k, v] of pairings) if (v.uid === user.id) pairings.delete(k);
     dropDeviceLinks(db, user.id);
-    saveDb();
+    await saveDb();
     audit(req, 'auth.logout.all', { user });
     json(res, 200, { ok: true }, { 'Set-Cookie': clearCookie });
   },
@@ -2303,7 +2318,7 @@ const routes = {
     const intake = readIntake(body);
     if (!intake) return json(res, 400, { error: 'a goal is required' });
     user.intake = { ...intake, submittedAt: new Date().toISOString() };
-    saveDb();
+    await saveDb();
     audit(req, 'client.intake', { user, msg: intake.goal });
     json(res, 200, { ok: true, intake: user.intake });
   },
@@ -2329,7 +2344,7 @@ const routes = {
         updated: null, resolvedAt: null, adminNote: ''
       });
     }
-    saveDb();
+    await saveDb();
     audit(req, 'client.request', { user, msg: kind + ' · ' + goal });
     json(res, 200, { ok: true, request: myRequest(user.id) });
   },
@@ -2414,7 +2429,7 @@ const routes = {
       text: text_, images, created: new Date().toISOString(), edited: null, replies: []
     };
     db.posts.push(post);
-    saveDb();
+    await saveDb();
     json(res, 200, { post: publicPost(post, user) });
   },
 
@@ -2434,7 +2449,7 @@ const routes = {
       id: crypto.randomBytes(9).toString('base64url'),
       userId: user.id, text: text_, created: new Date().toISOString()
     });
-    saveDb();
+    await saveDb();
     json(res, 200, { post: publicPost(post, user) });
   },
 
@@ -2454,7 +2469,7 @@ const routes = {
       if (post.userId !== user.id && !isAdmin(user)) return json(res, 403, { error: 'not yours to delete' });
       db.posts = db.posts.filter(p => p.id !== post.id);
     }
-    saveDb();
+    await saveDb();
     if (isAdmin(user) && post.userId !== user.id) audit(req, 'admin.post.delete', { user, msg: post.visibility });
     json(res, 200, { ok: true });
   },
@@ -2469,7 +2484,7 @@ const routes = {
     if (!user) return;
     const owner = db.posts.find(p => canSee(user, p) && (p.images || []).includes(req.mediaHash))?.userId;
     if (!owner) throw new MediaError(404, 'media-missing');
-    const f = MEDIA.file(owner, req.mediaHash);
+    const f = await Promise.resolve(MEDIA.file(owner, req.mediaHash));
     if (!f) throw new MediaError(404, 'media-missing');
     await sendMediaFile(res, f, req.mediaHash);
   },
@@ -2531,7 +2546,7 @@ const routes = {
       else delete body.state.resetIds;
     }
     body.state._rev = curRev + 1;          // server-owned; whatever the client sent is ignored
-    atomicWrite(stateFile(user.id), JSON.stringify(body.state));
+    await writeState(user.id, body.state);
     // The stat cache cannot see this write on its own: mtime granularity is 4 ms here (ext4 on
     // this kernel — 3901 of 3999 back-to-back same-size writes shared one timestamp), and a
     // `_rev` going from 7 to 8 does not change the file's size, so two writes inside one 4 ms
@@ -2543,7 +2558,7 @@ const routes = {
     // referencing. Bookkeeping only: the state is already saved, so nothing here may turn a
     // successful write into an error.
     if (MEDIA_ON) {
-      try { MEDIA.noteState(user.id, body.state); } catch (e) { console.error('media noteState', e); }
+      try { await Promise.resolve(MEDIA.noteState(user.id, body.state)); } catch (e) { console.error('media noteState', e); }
     }
     json(res, 200, { ok: true, ts: body.state._ts || null, rev: body.state._rev });
   },
@@ -2576,7 +2591,7 @@ const routes = {
       db.subs = db.subs.filter(s => !drop.has(s.endpoint));
     }
     db.subs.push({ userId: user.id, endpoint: sub.endpoint, keys, ...(deviceId ? { deviceId } : {}), created: prev?.created || new Date().toISOString() });
-    saveDb();
+    await saveDb();
     json(res, 200, { ok: true });
   },
 
@@ -2595,7 +2610,7 @@ const routes = {
     if (!user) return json(res, 401, { error: 'not signed in' });
     const body = await readBody(req);
     db.subs = db.subs.filter(s => !(s.userId === user.id && s.endpoint === body.endpoint));
-    saveDb();
+    await saveDb();
     json(res, 200, { ok: true });
   },
 
@@ -2750,7 +2765,7 @@ const routes = {
       updatedBy: admin.name || admin.id,
       note: text(body.plan.note).slice(0, 500)
     };
-    writePlan(u.id, next);
+    await writePlan(u.id, next);
     audit(req, 'admin.plan.write', { user: admin, target: u, msg: routines.length + ' routines' });
     json(res, 200, { ok: true, plan: next });
   },
@@ -2782,7 +2797,7 @@ const routes = {
     } else {
       return json(res, 400, { error: 'action must be activate, extend or expire' });
     }
-    saveDb();
+    await saveDb();
     audit(req, 'admin.subscription', { user: admin, target: u, msg: action });
     json(res, 200, { ok: true, sub: subOf(u) });
   },
@@ -2795,7 +2810,7 @@ const routes = {
     const u = db.users.find(x => x.id === text(body.id));
     if (!u) return json(res, 404, { error: 'no such user' });
     delete u.device;
-    saveDb();
+    await saveDb();
     audit(req, 'admin.device.release', { user: admin, target: u });
     json(res, 200, { ok: true });
   },
@@ -2825,7 +2840,7 @@ const routes = {
     r.status = status;
     r.adminNote = text(body.adminNote).slice(0, 1000);
     r.resolvedAt = status === 'done' ? new Date().toISOString() : null;
-    saveDb();
+    await saveDb();
     audit(req, 'admin.request.resolve', { user: admin, msg: status });
     json(res, 200, { ok: true, request: r });
   },
@@ -2840,7 +2855,7 @@ const routes = {
     if (u.disabled) presence.delete(u.id);   // drop them off "training now" at once
     // A device link made before the lock would otherwise still be waiting when it is lifted.
     if (u.disabled) dropDeviceLinks(db, u.id);
-    saveDb();
+    await saveDb();
     audit(req, u.disabled ? 'admin.user.disable' : 'admin.user.enable', { user: admin, target: u });
     json(res, 200, { ok: true, id: u.id, disabled: u.disabled });
   },
@@ -2873,7 +2888,7 @@ const routes = {
       dropDeviceLinks(db, u.id);
       presence.delete(u.id);
     }
-    saveDb();
+    await saveDb();
     audit(req, make ? 'admin.role.grant' : 'admin.role.revoke', { user: owner, target: u });
     json(res, 200, { ok: true, id: u.id, admin: make });
   },
@@ -2903,12 +2918,12 @@ const routes = {
     presence.delete(u.id);
     // The training history, the coach's program for them, and any Coach credential of theirs —
     // all three outside db.json.
-    try { fs.unlinkSync(stateFile(u.id)); } catch { /* already gone */ }
-    try { fs.unlinkSync(planFile(u.id)); } catch { /* never had one */ }
+    try { await store.deleteState(u.id); } catch { /* already gone */ }
+    try { await store.deletePlan(u.id); } catch { /* never had one */ }
     try { coachConfig.clearProfileAuth(u.id); } catch { /* nothing stored */ }
     // Their photos and videos — the one place a profile's folder under uploads/ is removed.
-    try { MEDIA.removeUser(u.id); } catch (e) { console.error('media: could not remove uploads of', u.id, e.message); }
-    saveDb();
+    try { await Promise.resolve(MEDIA.removeUser(u.id)); } catch (e) { console.error('media: could not remove uploads of', u.id, e.message); }
+    await saveDb();
     // Logged with the name, because the id is about to mean nothing to anyone reading this back.
     audit(req, 'admin.user.delete', { user: admin, msg: name });
     json(res, 200, { ok: true, id: u.id });
@@ -2934,7 +2949,7 @@ const routes = {
     do { code = crypto.randomBytes(8).toString('hex').toUpperCase(); } while (db.invites.some(i => i.code === code));
     const invite = { code, note: text(body.note).slice(0, 60), createdBy: admin.id, created: new Date().toISOString() };
     db.invites.push(invite);
-    saveDb();
+    await saveDb();
     audit(req, 'admin.invite.create', { user: admin, msg: code });
     json(res, 200, { invite });
   },
@@ -2946,7 +2961,7 @@ const routes = {
     if (!inv) return json(res, 404, { error: 'no such code' });
     if (inv.usedBy) return json(res, 400, { error: 'already used — cannot revoke' });
     db.invites = db.invites.filter(i => i.code !== inv.code);
-    saveDb();
+    await saveDb();
     audit(req, 'admin.invite.revoke', { user: admin, msg: inv.code });
     json(res, 200, { ok: true });
   },
@@ -2958,6 +2973,9 @@ const routes = {
   // on the hourly compaction, so nothing past its retention is ever served.
   'GET /api/admin/audit': async (req, res) => {
     if (!requireAdmin(req, res)) return;
+    if (store.refreshAudit) {
+      try { await store.refreshAudit(); } catch (e) { console.error('audit refresh', e.message); }
+    }
     const q = new URL(req.url, 'http://x').searchParams;
     const limit = Math.max(1, Math.min(200, +q.get('limit') || 100));
     const before = +q.get('before') || Infinity;
@@ -2981,7 +2999,8 @@ const routes = {
   // ./data/audit.log already is the export, in a format jq reads directly.
   'POST /api/admin/audit/clear': async (req, res) => {
     const admin = requireAdmin(req, res); if (!admin) return;
-    try { fs.unlinkSync(auditFile); } catch { /* nothing logged yet */ }
+    try { store.writeAuditLines([]); } catch { /* nothing logged yet */ }
+    if (store.refreshAudit) store._auditCache = [];
     auditCount = 0;
     audit(req, 'admin.audit.clear', { user: admin });
     json(res, 200, { ok: true });
@@ -3040,17 +3059,27 @@ function bodyDeadline(req) {
 
 const server = http.createServer(async (req, res) => {
   bodyDeadline(req);
-  // Same-origin (the deployed nginx-proxied web app) never triggers CORS, so this only matters
-  // for the paired mobile app calling in from its own WebView origin. It carries no cookie
-  // (auth is the Authorization header instead), so Allow-Credentials is deliberately never set —
-  // reflecting the origin here can't expose the cookie session to anyone.
+  /* Cross-origin: the Vercel app talks to this Render host. Only ORIGIN may read responses with
+     cookies; reflecting any Origin would let a hostile page ride the session. Bearer (paired
+     phone / web token) still works from that same Origin. */
   const origin = req.headers.origin;
-  if (origin) { res.setHeader('Access-Control-Allow-Origin', origin); res.setHeader('Vary', 'Origin'); }
+  const corsOk = origin && originsMatch(origin, ORIGIN);
+  if (corsOk) {
+    res.setHeader('Access-Control-Allow-Origin', origin.replace(/\/+$/, ''));
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
+  }
   if (req.method === 'OPTIONS') {
+    if (!corsOk && origin) return json(res, 403, { error: 'cross-origin request refused' });
     res.writeHead(204, {
       'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Max-Age': '86400'
+      'Access-Control-Max-Age': '86400',
+      ...(corsOk ? {
+        'Access-Control-Allow-Origin': origin.replace(/\/+$/, ''),
+        'Access-Control-Allow-Credentials': 'true',
+        Vary: 'Origin'
+      } : {})
     });
     return res.end();
   }

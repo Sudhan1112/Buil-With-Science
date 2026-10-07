@@ -1,0 +1,35 @@
+# CareFit API on Render (long-running Node process). Pair with:
+#   - Vercel project rooted at frontend/ (VITE_API_BASE=https://<this-service>.onrender.com)
+#   - Supabase project (apply supabase/migrations/*.sql, then scripts/import-to-supabase.mjs)
+#
+# After the first Vercel deploy, set ORIGIN and RP_ID to the pinned https://<app>.vercel.app
+# host (full subdomain — not "vercel.app") and restart this service.
+services:
+  - type: web
+    name: carefit-api
+    runtime: docker
+    rootDir: api
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: "3000"
+      - key: PASSWORD_LOGIN
+        value: "1"
+      - key: TRUST_PROXY
+        value: "1"
+      - key: ORIGIN
+        sync: false
+      - key: RP_ID
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
+      - key: ADMIN_UIDS
+        sync: false

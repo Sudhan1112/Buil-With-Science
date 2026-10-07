@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { api, setRemoteAuth } from '../lib/api.js'
+import { api, setRemoteAuth, clearSessionToken } from '../lib/api.js'
 import { localTZ } from '../lib/format.js'
 import { t } from '../lib/i18n.js'
 import { registerCustom } from '../lib/exercises.js'
@@ -673,6 +673,7 @@ export const useStore = create((set, get) => {
     forgetSync()
     releaseAdopt()   // the copy it was about is gone
     localStorage.removeItem(KEY)
+    clearSessionToken() // cross-origin Bearer (Vercel → Render); cookie clear is /api/logout
     // Signed out, this device is nobody's: the sign-in screen is in the instance's language.
     persist(freshState(), false)
     localStorage.removeItem('gym_owner_name')
