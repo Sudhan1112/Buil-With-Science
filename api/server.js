@@ -2038,7 +2038,12 @@ const mediaRoutes = {
 
 /* ---------- routes ---------- */
 const routes = {
-  'GET /api/health': async (req, res) => json(res, 200, { ok: true, users: db.users.length }),
+  'GET /api/health': async (req, res) => json(res, 200, {
+    ok: true,
+    users: db.users.length,
+    store: store.kind,
+    supabase: !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  }),
 
   // Public config the login screen needs before anyone is signed in. `coach` is absent unless
   // the instance has both switched the Coach on and successfully connected a provider — the

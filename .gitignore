@@ -11,6 +11,9 @@ backups/
 # Local config
 .env
 
+# One-shot SQL dump of local ./data (password hashes) — generate with scripts/build-import-sql.mjs
+scripts/import-data.sql
+
 # Build output / deps
 frontend/dist/
 node_modules/

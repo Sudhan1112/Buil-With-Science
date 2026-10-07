@@ -43,9 +43,22 @@ db.planRequests = db.planRequests || [];
 db.posts = db.posts || [];
 
 const ok = (label, error) => {
-  if (error) { console.error(label, error.message); process.exit(1); }
+  if (error) {
+    console.error(label, error.message || error);
+    if (error.cause) console.error('  cause:', error.cause?.message || error.cause);
+    if (String(error.message || '').includes('fetch failed')) {
+      console.error('  Hint: use the real service_role JWT from Supabase → Project Settings → API Keys');
+      console.error('  (starts with eyJ… and is long — not the literal text "eyJ...")');
+      console.error('  SUPABASE_URL must be https://xxxx.supabase.co with no /rest/v1/');
+    }
+    process.exit(1);
+  }
   console.log(label, 'ok');
 };
+if (!key.startsWith('eyJ') || key.length < 80 || key === 'eyJ...') {
+  console.error('SUPABASE_SERVICE_ROLE_KEY looks wrong. Paste the full service_role secret from the dashboard.');
+  process.exit(1);
+}
 
 async function upsert(table, rows) {
   if (!rows.length) { console.log(table, '(empty)'); return; }
